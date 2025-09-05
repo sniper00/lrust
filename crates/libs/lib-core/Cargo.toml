@@ -1,0 +1,14 @@
+[package]
+name = "lib-core"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+doctest = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+dashmap = "6.1.0"
+lazy_static = "1.5.0"
+reqwest = { version = "0.12", features = ["rustls-tls","trust-dns"],default-features = false}

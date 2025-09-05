@@ -1,0 +1,508 @@
+use crate::{moon_log, moon_send, LOG_LEVEL_ERROR, LOG_LEVEL_INFO};
+use anyhow::{anyhow, Result};
+use bytes::{Buf, BufMut};
+use dashmap::DashMap;
+use http::uri::PathAndQuery;
+use lazy_static::lazy_static;
+use serde::de::Error;
+use serde::{Deserialize, Deserializer};
+use std::collections::HashMap;
+use std::ffi::{c_char, c_int, c_void};
+use std::slice;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use tokio::sync::mpsc;
+use tonic::client::Grpc;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, Uri};
+use tonic::{
+    codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
+    Status,
+};
+
+use lib_core::context::CONTEXT;
+use lib_lua::laux::{lua_into_userdata, LuaArgs, LuaNil, LuaTable, LuaValue};
+use lib_lua::luaL_newlib;
+use lib_lua::{self, cstr, ffi, ffi::luaL_Reg, laux, lreg, lreg_null, push_lua_table};
+
+lazy_static! {
+    static ref GRPC_CONNECTIONSS: DashMap<String, DatabaseConnection> = DashMap::new();
+}
+
+#[derive(Debug)]
+pub struct Base64(Vec<u8>);
+
+impl<'de> Deserialize<'de> for Base64 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Vis;
+        impl serde::de::Visitor<'_> for Vis {
+            type Value = Base64;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a base64 string")
+            }
+
+            fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+                base64::decode(v).map(Base64).map_err(Error::custom)
+            }
+        }
+        deserializer.deserialize_str(Vis)
+    }
+}
+
+const NEW_CONNECTION: i32 = 0;
+const CLOSE_CONNECTION: i32 = 1;
+const UNARY: i32 = 2;
+const NEW_STREAM: i32 = 3;
+const CLOSE_STREAM: i32 = 4;
+const CLOSE_SEND: i32 = 5;
+const STREAM_SEND: i32 = 6;
+const STREAM_RECV: i32 = 7;
+
+#[derive(Deserialize, Debug)]
+struct GrpcCommand {
+    owner: u32,
+    session: i64,
+    cmd: i32,
+    key: String,
+    host: Option<String>,
+    ca: Option<String>,
+    cert: Option<String>,
+    priv_key: Option<String>,
+    path: Option<String>,
+    payload: Option<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct DatabaseConnection {
+    tx: mpsc::Sender<GrpcRequest>,
+    counter: Arc<AtomicI64>,
+}
+
+struct ConnectRequest {
+    url: String,
+    host: Option<String>,
+    ca: Option<String>,
+    cert: Option<String>,
+    priv_key: Option<String>,
+}
+
+struct UnaryRequest {
+    path: String,
+    payload: Option<Vec<u8>>,
+}
+
+struct StreamRequest {
+    path: String,
+    payload: Option<Vec<u8>>,
+}
+
+enum GrpcRequest {
+    Connect(ConnectRequest),
+    Unary(UnaryRequest),
+}
+
+enum GrpcResponse {
+    Connect,
+    Error(anyhow::Error),
+    Timeout(String),
+    Transaction,
+}
+
+#[derive(Clone)]
+struct TaskQueueHandle(*const c_void);
+unsafe impl Send for TaskQueueHandle {}
+unsafe impl Sync for TaskQueueHandle {}
+
+#[derive(Clone, Debug)]
+struct TaskHandle(*const c_void);
+unsafe impl Send for TaskHandle {}
+unsafe impl Sync for TaskHandle {}
+
+struct EncodedBytes(*mut c_char, usize, bool);
+unsafe impl Send for EncodedBytes {}
+unsafe impl Sync for EncodedBytes {}
+
+struct MyCodec;
+
+impl Codec for MyCodec {
+    type Encode = EncodedBytes;
+    type Decode = EncodedBytes;
+
+    type Encoder = Self;
+    type Decoder = Self;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        MyCodec
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        MyCodec
+    }
+}
+
+impl Encoder for MyCodec {
+    type Item = EncodedBytes;
+    type Error = Status;
+
+    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        let slice = unsafe { slice::from_raw_parts(item.0 as *const u8, item.1) };
+        dst.put_slice(slice);
+        if item.2 {
+            unsafe {
+                libc::free(item.0 as *mut c_void);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Decoder for MyCodec {
+    type Item = EncodedBytes;
+    type Error = Status;
+
+    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        let chunk = buf.chunk();
+        let len = chunk.len();
+        if len > 0 {
+            let cbuf = unsafe { libc::malloc(len) };
+            unsafe { libc::memcpy(cbuf, chunk.as_ptr() as *const c_void, len) };
+            buf.advance(len);
+            Ok(Some(EncodedBytes(cbuf as *mut c_char, len, false)))
+        } else {
+            Ok(Some(EncodedBytes(
+                std::ptr::null_mut() as *mut c_char,
+                0,
+                false,
+            )))
+        }
+    }
+}
+
+fn respond_error(err: &dyn std::error::Error, task: &TaskHandle) {
+    unsafe {
+        let desc = err.source().unwrap().to_string();
+        let res = libc::malloc(desc.len());
+        libc::memcpy(res, desc.as_ptr() as *const c_void, desc.len());
+        let len = desc.len();
+        ngx_http_lua_ffi_respond(task.0, 1, res as *mut c_char, len as i32);
+    }
+}
+
+async fn grpc_handler(
+    protocol_type: u8,
+    cli: &Grpc<Channel>,
+    mut rx: mpsc::Receiver<GrpcRequest>,
+    counter: Arc<AtomicI64>,
+) {
+
+}
+
+async fn do_connect(req: &ConnectRequest) -> Result<Grpc<Channel>> {
+    let mut url = req.url.clone();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        url = format!("http://{}", url);
+    }
+
+    let client = if req.ca.is_some() {
+        let ca = Certificate::from_pem(req.ca.as_ref().unwrap());
+        let mut tls = ClientTlsConfig::new().ca_certificate(ca);
+
+        if req.host.is_some() {
+            tls = tls.domain_name(req.host.as_ref().unwrap());
+        }
+
+        if req.cert.is_some() && req.priv_key.is_some() {
+            let identity =
+                Identity::from_pem(req.cert.as_ref().unwrap(), req.priv_key.as_ref().unwrap());
+            tls = tls.identity(identity);
+        }
+
+        let channel = Channel::builder(Uri::from_str(&url)?)
+            .tls_config(tls)?
+            .connect()
+            .await?;
+
+        tonic::client::Grpc::new(channel)
+    } else {
+        let channel = tonic::transport::Endpoint::new(url)?.connect().await?;
+
+        tonic::client::Grpc::new(channel)
+    };
+
+    Ok(client)
+}
+
+extern "C-unwind" fn connect(state: LuaState) -> c_int {
+    let protocol_type: u8 = laux::opt_field(state, 1, "protocol_type").unwrap_or(0);
+    let session = laux::opt_field(state, 1, "session").unwrap_or(0);
+    let owner = laux::opt_field(state, 1, "owner").unwrap_or_default();
+    let name: String = laux::opt_field(state, 1, "name").unwrap_or_default();
+
+    let cmd = ConnectRequest {
+        url: laux::opt_field(state, 1, "url").unwrap_or_default(),
+        host: laux::opt_field(state, 1, "host").and_then(|val| Some(val)),
+        ca: laux::opt_field(state, 1, "ca").and_then(|val| Some(val)),
+        cert: laux::opt_field(state, 1, "cert").and_then(|val| Some(val)),
+        priv_key: laux::opt_field(state, 1, "priv_key").and_then(|val| Some(val)),
+    };
+
+    CONTEXT.tokio_runtime.spawn(async move {
+        match do_connect(&cmd).await {
+            Ok(cli) => {
+                let (tx, rx) = mpsc::channel(100);
+                let counter = Arc::new(AtomicI64::new(0));
+                GRPC_CONNECTIONSS.insert(
+                    name.to_string(),
+                    DatabaseConnection {
+                        tx: tx.clone(),
+                        counter: counter.clone(),
+                    },
+                );
+                moon_send(protocol_type, owner, session, GrpcResponse::Connect);
+                grpc_handler(protocol_type, &cli, rx, counter).await;
+            }
+            Err(err) => {
+                moon_send(protocol_type, owner, session, GrpcResponse::Error(err));
+            }
+        }
+    });
+
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn libffi_init(_cfg: *mut c_char, tq: *const c_void) -> c_int {
+    let tq = TaskQueueHandle(tq);
+
+    thread::spawn(move || {
+        rt.block_on(async move {
+            let obj_cnt = Arc::new(AtomicU64::new(1));
+            let clients = Arc::new(Mutex::new(HashMap::new()));
+            let streams = Arc::new(Mutex::new(HashMap::new()));
+            let tq = tq.clone();
+
+            loop {
+                let task = unsafe { TaskHandle(ngx_http_lua_ffi_task_poll(tq.0)) };
+                if task.0.is_null() {
+                    break;
+                }
+
+                let req_len = Box::<c_int>::new(0);
+                let ptr = Box::into_raw(req_len);
+                let req = unsafe { ngx_http_lua_ffi_get_req(task.0, ptr) };
+
+                let sli = unsafe { std::slice::from_raw_parts(req as *const u8, *ptr as usize) };
+                let mut cmd: GrpcCommand = serde_json::from_slice(sli).unwrap();
+                //println!("cmd: {:?}", cmd);
+
+                match cmd.cmd {
+                    NEW_CONNECTION => {
+                        let obj_cnt = obj_cnt.clone();
+                        let clients = clients.clone();
+                        tokio::spawn(async move {
+                            let task = task.clone();
+                            if !cmd.key.starts_with("http://") && !cmd.key.starts_with("https://") {
+                                cmd.key = format!("http://{}", cmd.key);
+                            }
+
+                            let cli = if cmd.ca.is_some() {
+                                let ca = Certificate::from_pem(cmd.ca.unwrap());
+                                let mut tls = ClientTlsConfig::new().ca_certificate(ca);
+
+                                if cmd.host.is_some() {
+                                    tls = tls.domain_name(cmd.host.unwrap());
+                                }
+
+                                if cmd.cert.is_some() {
+                                    let identity = Identity::from_pem(
+                                        cmd.cert.unwrap(),
+                                        cmd.priv_key.unwrap(),
+                                    );
+                                    tls = tls.identity(identity);
+                                }
+
+                                let channel = Channel::builder(Uri::from_str(&cmd.key).unwrap())
+                                    .tls_config(tls)
+                                    .unwrap()
+                                    .connect()
+                                    .await;
+
+                                if let Err(err) = &channel {
+                                    respond_error(err, &task);
+                                    return;
+                                }
+
+                                tonic::client::Grpc::new(channel.unwrap())
+                            } else {
+                                let ep = tonic::transport::Endpoint::new(cmd.key)
+                                    .unwrap()
+                                    .connect()
+                                    .await;
+
+                                if let Err(err) = &ep {
+                                    respond_error(err, &task);
+                                    return;
+                                }
+
+                                tonic::client::Grpc::new(ep.unwrap())
+                            };
+
+                            let id = format!("cli-{}", obj_cnt.fetch_add(1, Ordering::SeqCst));
+                            unsafe {
+                                let res = libc::malloc(id.len());
+                                libc::memcpy(res, id.as_ptr() as *const c_void, id.len());
+                                let len = id.len();
+                                clients.lock().unwrap().insert(id, cli);
+                                ngx_http_lua_ffi_respond(task.0, 0, res as *mut c_char, len as i32);
+                            }
+                        });
+                    }
+                    CLOSE_CONNECTION => {
+                        clients.lock().unwrap().remove(&cmd.key);
+                        unsafe {
+                            ngx_http_lua_ffi_respond(task.0, 0, std::ptr::null_mut(), 0);
+                        }
+                    }
+                    UNARY => {
+                        let mut cli = clients.lock().unwrap().get(&cmd.key).unwrap().clone();
+                        tokio::spawn(async move {
+                            let task = task.clone();
+                            let mut vec = cmd.payload.unwrap().0;
+                            let buf = EncodedBytes(
+                                vec.as_mut_slice().as_mut_ptr() as *mut c_char,
+                                vec.len(),
+                                false,
+                            );
+                            cli.ready().await.unwrap();
+                            let path = PathAndQuery::from_str(cmd.path.as_ref().unwrap()).unwrap();
+                            let res = cli.unary(tonic::Request::new(buf), path, MyCodec).await;
+                            unsafe {
+                                if let Ok(mut res) = res {
+                                    ngx_http_lua_ffi_respond(
+                                        task.0,
+                                        0,
+                                        res.get_mut().0,
+                                        res.get_ref().1 as i32,
+                                    );
+                                } else {
+                                    ngx_http_lua_ffi_respond(task.0, 1, std::ptr::null_mut(), 0);
+                                }
+                            }
+                        });
+                    }
+                    NEW_STREAM => {
+                        let obj_cnt = obj_cnt.clone();
+                        let clients = clients.clone();
+                        let streams = streams.clone();
+                        tokio::spawn(async move {
+                            let task = task.clone();
+                            let mut cli = clients.lock().unwrap().get(&cmd.key).unwrap().clone();
+                            let (send_tx, send_rx) = mpsc::unbounded_channel::<EncodedBytes>();
+                            let send_stream =
+                                tokio_stream::wrappers::UnboundedReceiverStream::new(send_rx);
+                            let (recv_tx, mut recv_rx) = mpsc::unbounded_channel::<TaskHandle>();
+                            let path = PathAndQuery::from_str(cmd.path.as_ref().unwrap()).unwrap();
+                            cli.ready().await.unwrap();
+                            unsafe {
+                                let id =
+                                    format!("stream-{}", obj_cnt.fetch_add(1, Ordering::SeqCst));
+                                let res = libc::malloc(id.len());
+                                libc::memcpy(res, id.as_ptr() as *const c_void, id.len());
+                                let len = id.len();
+                                streams.lock().unwrap().insert(id, (Some(send_tx), recv_tx));
+                                ngx_http_lua_ffi_respond(task.0, 0, res as *mut c_char, len as i32);
+                            }
+                            let mut stream = cli
+                                .streaming(tonic::Request::new(send_stream), path, MyCodec)
+                                .await
+                                .unwrap()
+                                .into_inner();
+
+                            while let Some(task) = recv_rx.recv().await {
+                                if let Some(res) = stream.message().await.unwrap() {
+                                    unsafe {
+                                        ngx_http_lua_ffi_respond(task.0, 0, res.0, res.1 as i32);
+                                    }
+                                } else {
+                                    unsafe {
+                                        ngx_http_lua_ffi_respond(
+                                            task.0,
+                                            0,
+                                            std::ptr::null_mut(),
+                                            0,
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    STREAM_SEND => {
+                        let (send_tx, _) = streams.lock().unwrap().get(&cmd.key).unwrap().clone();
+                        let send_tx = send_tx.unwrap();
+                        let mut vec = cmd.payload.unwrap().0;
+                        let cbuf = unsafe { libc::malloc(vec.len()) };
+                        unsafe {
+                            libc::memcpy(
+                                cbuf,
+                                vec.as_mut_slice().as_mut_ptr() as *const c_void,
+                                vec.len(),
+                            )
+                        };
+                        let buf = EncodedBytes(cbuf as *mut c_char, vec.len(), true);
+                        unsafe {
+                            ngx_http_lua_ffi_respond(
+                                task.0,
+                                if send_tx.send(buf).is_ok() { 0 } else { 1 },
+                                std::ptr::null_mut(),
+                                0,
+                            );
+                        }
+                    }
+                    STREAM_RECV => {
+                        let (_, recv_tx) = streams.lock().unwrap().get(&cmd.key).unwrap().clone();
+                        let task = task.clone();
+                        recv_tx.send(task).unwrap();
+                    }
+                    CLOSE_STREAM => {
+                        streams.lock().unwrap().remove(&cmd.key);
+                        unsafe {
+                            ngx_http_lua_ffi_respond(task.0, 0, std::ptr::null_mut(), 0);
+                        }
+                    }
+                    CLOSE_SEND => {
+                        let (_, recv_tx) = streams.lock().unwrap().remove(&cmd.key).unwrap();
+                        streams.lock().unwrap().insert(cmd.key, (None, recv_tx));
+                        unsafe {
+                            ngx_http_lua_ffi_respond(task.0, 0, std::ptr::null_mut(), 0);
+                        }
+                    }
+                    _ => todo!(),
+                }
+            }
+        });
+
+        println!("shutdown tokio runtime");
+        rt.shutdown_background();
+    });
+
+    return 0;
+}
+
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C-unwind" fn luaopen_rust_grpc(state: LuaState) -> c_int {
+    let l = [
+        lreg!("connect", connect),
+        lreg!("find_connection", find_connection),
+        lreg!("decode", decode),
+        lreg!("stats", stats),
+        lreg!("make_transaction", make_transaction),
+        lreg_null!(),
+    ];
+
+    luaL_newlib!(state, l);
+
+    1
+}
