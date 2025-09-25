@@ -198,6 +198,7 @@ extern "C-unwind" fn lua_http_form_urldecode(state: LuaState) -> i32 {
     1
 }
 
+#[cfg(feature = "http")]
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_rust_httpc(state: LuaState) -> i32 {

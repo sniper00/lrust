@@ -9,6 +9,7 @@ This library provides Lua extensions for [Moon](https://github.com/sniper00/moon
         - [3. Sqlx](#3-sqlx)
         - [4. MongoDB](#4-mongodb)
         - [5. Crypto](#5-crypto)
+        - [6. SqlServer](#6-sqlserver)
 
 # Libraries
 
@@ -420,6 +421,116 @@ else
 end
 
 print("\n=== Test Complete ===")
+
+```
+
+### 6. SqlServer
+
+Modify lib-lualib/Cargo.toml to enable tiberius feature。
+
+```
+[features]
+default = ["excel", "sqlx", "mongodb", "websocket", "http", "json", tiberius]
+```
+
+```lua
+local moon = require("moon")
+local sqlserver = require("ext.sqlserver")
+
+local info = {
+    cc      = 300,
+    gpsname = "gps1",
+    track   = {
+        segments = {
+            [1] = {
+                HR        = 73,
+                location  = {
+                    [1] = 47.763,
+                    [2] = 13.4034,
+                },
+                starttime = "2018-10-14 10:05:14",
+            },
+            [2] = {
+                HR        = 130,
+                location  = {
+                    [1] = 47.706,
+                    [2] = 13.2635,
+                },
+                starttime = "2018-10-14 10:39:21",
+            },
+        },
+    },
+}
+
+-- Build connection string
+local config_string = sqlserver.build_connection_string({
+    server = "localhost",
+    port = 1433,
+    database = "testdb",
+    username = "sa",
+    password = "A12345678b!",
+    integrated_security = true,
+    trust_server_certificate = true
+})
+
+print(config_string)
+
+local sql = string.format([[
+        IF OBJECT_ID('userdata', 'U') IS NOT NULL DROP TABLE userdata;
+    ]])
+
+local sql2 = [[
+        --create userdata table
+        CREATE TABLE userdata (
+            uid BIGINT NOT NULL,
+            [key] NVARCHAR(255) NOT NULL,
+            value NVARCHAR(MAX),
+            CONSTRAINT pk_userdata PRIMARY KEY (uid, [key])
+        );
+]]
+
+moon.async(function()
+    -- Connect to database
+    local db = sqlserver.connect(config_string, "main_db", 30000)
+
+    if db.kind then
+        print("connect failed", db.message)
+        return
+    end
+
+    print_r(db:transaction({
+        { sql },
+        { sql2 },
+    }))
+
+    local result = db:query(
+        "MERGE userdata AS target USING (VALUES (@P1, @P2, @P3)) AS source (uid, [key], value) ON (target.uid = source.uid AND target.[key] = source.[key]) WHEN MATCHED THEN UPDATE SET value = source.value WHEN NOT MATCHED THEN INSERT (uid, [key], value) VALUES (source.uid, source.[key], source.value);",
+        235, "info2", info)
+    print_r(result)
+
+    local st = moon.clock()
+    local trans = {}
+    for i = 1, 10000 do
+        trans[#trans + 1] = {
+            "MERGE userdata AS target USING (VALUES (@P1, @P2, @P3)) AS source (uid, [key], value) ON (target.uid = source.uid AND target.[key] = source.[key]) WHEN MATCHED THEN UPDATE SET value = source.value WHEN NOT MATCHED THEN INSERT (uid, [key], value) VALUES (source.uid, source.[key], source.value);", 235,
+            "info2", info }
+    end
+    print_r(db:transaction(trans))
+    print("trans cost", moon.clock() - st)
+
+    local st = moon.clock()
+    for i = 10001, 20000 do
+        local res = db:query(
+            "MERGE userdata AS target USING (VALUES (@P1, @P2, @P3)) AS source (uid, [key], value) ON (target.uid = source.uid AND target.[key] = source.[key]) WHEN MATCHED THEN UPDATE SET value = source.value WHEN NOT MATCHED THEN INSERT (uid, [key], value) VALUES (source.uid, source.[key], source.value);",
+            235, "info2", info)
+        --  print_r(res)
+        if res.kind then
+            print("error", res.message)
+            break
+        end
+    end
+    print("cost", moon.clock() - st)
+end)
 
 ```
 

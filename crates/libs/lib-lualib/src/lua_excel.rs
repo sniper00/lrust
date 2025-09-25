@@ -166,6 +166,7 @@ extern "C-unwind" fn lua_excel_read(state: LuaState) -> i32 {
     }
 }
 
+#[cfg(feature = "excel")]
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_rust_excel(state: LuaState) -> i32 {

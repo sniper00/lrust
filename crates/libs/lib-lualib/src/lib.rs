@@ -1,10 +1,17 @@
+#[cfg(feature = "excel")]
 pub mod lua_excel;
+#[cfg(feature = "http")]
 pub mod lua_http;
-// pub mod lua_opendal;
+#[cfg(feature = "json")]
 pub mod lua_json;
 pub mod lua_runtime;
+#[cfg(feature = "sqlx")]
 pub mod lua_sqlx;
+#[cfg(feature = "tiberius")]
+pub mod lua_tiberius;
+#[cfg(feature = "mongodb")]
 pub mod lua_mongodb;
+#[cfg(feature = "websocket")]
 pub mod lua_websocket;
 pub mod lua_crypto;
 

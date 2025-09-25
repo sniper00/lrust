@@ -354,6 +354,7 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
     }
 }
 
+#[cfg(feature = "websocket")]
 #[no_mangle]
 pub extern "C-unwind" fn luaopen_rust_websocket(state: LuaState) -> i32 {
     let l = [

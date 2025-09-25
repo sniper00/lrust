@@ -1,5 +1,6 @@
----@diagnostic disable: inject-field
+---@diagnostic disable: inject-field, undefined-global
 local moon = require "moon"
+---@type any
 local c = require "rust.sqlx"
 
 local protocol_type = 23

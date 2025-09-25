@@ -1021,6 +1021,7 @@ fn bson_to_lua(state: LuaState, value: &Bson) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "mongodb")]
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_rust_mongodb(state: LuaState) -> i32 {

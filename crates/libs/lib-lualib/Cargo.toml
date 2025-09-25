@@ -5,6 +5,16 @@ edition = "2021"
 build = "build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["excel", "sqlx", "mongodb", "websocket", "http", "json"]
+excel = ["dep:calamine", "dep:csv"]
+sqlx = ["dep:sqlx"]
+mongodb = ["dep:mongodb", "dep:futures"]
+websocket = ["dep:tokio-tungstenite", "dep:futures", "dep:futures-util"]
+http = ["dep:reqwest", "dep:percent-encoding", "dep:form_urlencoded", "dep:url", "json"]
+json = ["dep:serde", "dep:serde_json"]
+tiberius = ["dep:tiberius", "dep:futures", "dep:tokio-util", "json"]
+
 [lib]
 name = "rust"
 crate-type = ["cdylib"]
@@ -16,28 +26,30 @@ lib-core = { path = "../../libs/lib-core"}
 lib-lua = {package = "lib-lua-sys", path = "../../libs/lib-lua-sys",features = ["lua54"]}
 tokio = { version = "1", features = ["full"] }
 log = "0.4.0"
-calamine = "^0.28"
-csv = "1.3.0"
+calamine = { version = "^0.30", optional = true }
+csv = { version = "1.3.0", optional = true }
 
 bytes = "1.5.0"
 base64 = "^0.22"
 
-reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false}
-serde = { version = "1.0", features = ["derive"]}
-serde_json = {version = "1.0"}
-percent-encoding = "2.3.1"
-form_urlencoded = "1.2.1"
-url = "2.5.0"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false, optional = true}
+serde = { version = "1.0", features = ["derive"], optional = true}
+serde_json = {version = "1.0", optional = true}
+percent-encoding = { version = "2.3.1", optional = true}
+form_urlencoded = { version = "1.2.1", optional = true}
+url = { version = "2.5.0", optional = true}
 
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "mysql"] }
-mongodb = "3.2"
-futures = "0.3"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "mysql"], optional = true }
+mongodb = { version = "3.2", optional = true }
+futures = { version = "0.3", optional = true }
 
 dashmap = "6.1.0"
 lazy_static = "1.5.0"
 
-tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"]}
-futures-util = { version = "0.3.28", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"], optional = true}
+futures-util = { version = "0.3.28", default-features = false, features = ["sink", "std"], optional = true }
+tiberius = { version = "0.12", default-features = true, optional = true }
+tokio-util = { version = "0.7", features = ["compat"], optional = true }
 
 ring = "0.17"
 rand = "0.9"
@@ -60,4 +72,4 @@ rand = "0.9"
 #   "services-webhdfs",
 #   "services-azfile",
 #   "services-mysql"
-# ] }
+# ], optional = true }

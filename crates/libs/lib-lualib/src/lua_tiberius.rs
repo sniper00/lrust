@@ -1,169 +1,141 @@
 use crate::lua_json::{encode_table, JsonOptions};
 use crate::{moon_log, moon_send, LOG_LEVEL_ERROR, LOG_LEVEL_INFO};
 use dashmap::DashMap;
+use futures::TryFutureExt;
 use lazy_static::lazy_static;
 use lib_core::context::CONTEXT;
 use lib_lua::laux::{lua_into_userdata, LuaArgs, LuaNil, LuaState, LuaTable, LuaValue};
 use lib_lua::luaL_newlib;
 use lib_lua::{self, cstr, ffi, laux, lreg, lreg_null, push_lua_table};
-use sqlx::migrate::MigrateDatabase;
-use sqlx::mysql::MySqlRow;
-use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::sqlite::SqliteRow;
-use sqlx::ColumnIndex;
-use sqlx::ValueRef;
-use sqlx::{
-    Column, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo,
-};
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tiberius::{Client, Config, Result as TiberiusResult, Row};
+use tokio_util::compat::{TokioAsyncWriteCompatExt, Compat};
+use tokio::net::TcpStream;
 
 lazy_static! {
-    static ref DATABASE_CONNECTIONSS: DashMap<String, DatabaseConnection> = DashMap::new();
+    static ref DATABASE_CONNECTIONS: DashMap<String, DatabaseConnection> = DashMap::new();
 }
 
-enum DatabasePool {
-    MySql(MySqlPool),
-    Postgres(PgPool),
-    Sqlite(SqlitePool),
+type TiberiusClient = Client<Compat<TcpStream>>;
+
+struct DatabasePool {
+    client: TiberiusClient,
 }
 
 impl DatabasePool {
-    async fn connect(database_url: &str, timeout_duration: Duration) -> Result<Self, sqlx::Error> {
+    async fn connect(config_str: &str, timeout_duration: Duration) -> TiberiusResult<Self> {
         async fn connect_with_timeout<F, T>(
             timeout_duration: Duration,
             connect_future: F,
-        ) -> Result<T, sqlx::Error>
+        ) -> TiberiusResult<T>
         where
-            F: std::future::Future<Output = Result<T, sqlx::Error>>,
+            F: std::future::Future<Output = TiberiusResult<T>>,
         {
             timeout(timeout_duration, connect_future)
                 .await
-                .map_err(|err| {
-                    sqlx::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Connection error: {}", err),
-                    ))
+                .map_err(|_| tiberius::error::Error::Io {
+                    kind: std::io::ErrorKind::Other,
+                    message: "Connection timeout".to_string(),
                 })?
         }
 
-        if database_url.starts_with("mysql://") {
-            let pool =
-                connect_with_timeout(timeout_duration, MySqlPool::connect(database_url)).await?;
-            Ok(DatabasePool::MySql(pool))
-        } else if database_url.starts_with("postgres://") {
-            let pool = connect_with_timeout(
-                timeout_duration,
-                PgPoolOptions::new()
-                    .max_connections(1)
-                    .acquire_timeout(Duration::from_secs(2))
-                    .connect(database_url),
-            )
-            .await?;
-            Ok(DatabasePool::Postgres(pool))
-        } else if database_url.starts_with("sqlite://") {
-            if !Sqlite::database_exists(database_url).await? {
-                Sqlite::create_database(database_url).await?;
-            }
-            let pool =
-                connect_with_timeout(timeout_duration, SqlitePool::connect(database_url)).await?;
-            Ok(DatabasePool::Sqlite(pool))
-        } else {
-            Err(sqlx::Error::Configuration(
-                "Unsupported database type".into(),
-            ))
-        }
+        let mut config = Config::from_ado_string(config_str)?;
+        
+        // Ensure proper configuration for SQL Server 2017
+        config.trust_cert(); // Trust self-signed certificates
+        
+        let tcp = connect_with_timeout(
+            timeout_duration,
+            TcpStream::connect(config.get_addr()).map_err(|e| tiberius::error::Error::Io {
+                kind: e.kind(),
+                message: e.to_string(),
+            }),
+        ).await?;
+        tcp.set_nodelay(true)?;
+
+        let client = connect_with_timeout(
+            timeout_duration,
+            Client::connect(config, tcp.compat_write()),
+        ).await?;
+
+        Ok(DatabasePool { client })
     }
 
-    fn make_query<'a, DB: sqlx::Database>(
-        sql: &'a str,
-        binds: &'a [QueryParams],
-    ) -> Result<sqlx::query::Query<'a, DB, <DB as sqlx::Database>::Arguments<'a>>, sqlx::Error>
-    where
-        bool: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        i64: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        f64: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        &'a str: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        serde_json::Value: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        &'a Vec<u8>: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-    {
-        let mut query = sqlx::query(sql);
-        for bind in binds {
-            query = match bind {
-                QueryParams::Bool(value) => query.bind(*value),
-                QueryParams::Int(value) => query.bind(*value),
-                QueryParams::Float(value) => query.bind(*value),
-                QueryParams::Text(value) => query.bind(value.as_str()),
-                QueryParams::Json(value) => query.bind(value),
-                QueryParams::Bytes(value) => query.bind(value),
-            };
+    async fn query(&mut self, request: &DatabaseQuery) -> TiberiusResult<Vec<Row>> {
+        let mut query = tiberius::Query::new(&request.sql);
+        
+        for param in request.binds.iter() {
+            match param {
+                QueryParams::Bool(val) => query.bind(*val),
+                QueryParams::Int(val) => query.bind(*val),
+                QueryParams::Float(val) => query.bind(*val),
+                QueryParams::Text(val) => query.bind(val.as_str()),
+                QueryParams::Json(val) => query.bind(serde_json::to_string(val).unwrap()),
+                QueryParams::Bytes(val) => query.bind(val.as_slice()),
+            }
         }
-        Ok(query)
+        
+        let stream = query.query(&mut self.client).await?;
+        let result = stream.into_results().await?;
+        
+        let mut rows = Vec::new();
+        for row_set in result {
+            rows.extend(row_set);
+        }
+        
+        Ok(rows)
     }
 
-    async fn query(&self, request: &DatabaseQuery) -> Result<DatabaseResponse, sqlx::Error> {
-        match self {
-            DatabasePool::MySql(pool) => {
-                let query = Self::make_query(&request.sql, &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
-                Ok(DatabaseResponse::MysqlRows(rows))
-            }
-            DatabasePool::Postgres(pool) => {
-                let query = Self::make_query(&request.sql, &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
-                Ok(DatabaseResponse::PgRows(rows))
-            }
-            DatabasePool::Sqlite(pool) => {
-                let query = Self::make_query(&request.sql, &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
-                Ok(DatabaseResponse::SqliteRows(rows))
+    async fn execute(&mut self, request: &DatabaseQuery) -> TiberiusResult<u64> {
+        let mut query = tiberius::Query::new(&request.sql);
+        
+        for param in request.binds.iter() {
+            match param {
+                QueryParams::Bool(val) => query.bind(*val),
+                QueryParams::Int(val) => query.bind(*val),
+                QueryParams::Float(val) => query.bind(*val),
+                QueryParams::Text(val) => query.bind(val.as_str()),
+                QueryParams::Json(val) => query.bind(serde_json::to_string(val).unwrap()),
+                QueryParams::Bytes(val) => query.bind(val.as_slice()),
             }
         }
+        
+        let result = query.execute(&mut self.client).await?;
+        Ok(result.total())
     }
 
-    async fn transaction(
-        &self,
-        requests: &[DatabaseQuery],
-    ) -> Result<DatabaseResponse, sqlx::Error> {
-        match self {
-            DatabasePool::MySql(pool) => {
-                let mut transaction = pool.begin().await?;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    query.execute(&mut *transaction).await?;
+    async fn batch_execute(&mut self, requests: &[DatabaseQuery]) -> TiberiusResult<DatabaseResponse> {
+        // Execute queries in batch without transaction
+        for request in requests {
+            let mut query = tiberius::Query::new(&request.sql);
+            
+            for param in request.binds.iter() {
+                match param {
+                    QueryParams::Bool(val) => query.bind(*val),
+                    QueryParams::Int(val) => query.bind(*val),
+                    QueryParams::Float(val) => query.bind(*val),
+                    QueryParams::Text(val) => query.bind(val.as_str()),
+                    QueryParams::Json(val) => query.bind(serde_json::to_string(val).unwrap()),
+                    QueryParams::Bytes(val) => query.bind(val.as_slice()),
                 }
-                transaction.commit().await?;
-                Ok(DatabaseResponse::Transaction)
             }
-            DatabasePool::Postgres(pool) => {
-                let mut transaction = pool.begin().await?;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    query.execute(&mut *transaction).await?;
-                }
-                transaction.commit().await?;
-                Ok(DatabaseResponse::Transaction)
-            }
-            DatabasePool::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    query.execute(&mut *transaction).await?;
-                }
-                transaction.commit().await?;
-                Ok(DatabaseResponse::Transaction)
-            }
+            
+            query.execute(&mut self.client).await?;
         }
+        
+        Ok(DatabaseResponse::Transaction)
     }
 }
 
 enum DatabaseRequest {
-    Query(u32, i64, DatabaseQuery), //owner, session, QueryBuilder
-    Transaction(u32, i64, Vec<DatabaseQuery>), //owner, session, Vec<QueryBuilder>
+    Query(u32, i64, DatabaseQuery),
+    Execute(u32, i64, DatabaseQuery),
+    Transaction(u32, i64, Vec<DatabaseQuery>),
     Close(),
 }
 
@@ -175,10 +147,9 @@ struct DatabaseConnection {
 
 enum DatabaseResponse {
     Connect,
-    PgRows(Vec<PgRow>),
-    MysqlRows(Vec<MySqlRow>),
-    SqliteRows(Vec<SqliteRow>),
-    Error(sqlx::Error),
+    Rows(Vec<Row>),
+    Execute(u64),
+    Error(tiberius::error::Error),
     Timeout(String),
     Transaction,
 }
@@ -200,24 +171,24 @@ struct DatabaseQuery {
 }
 
 async fn handle_result(
-    database_url: &str,
+    config_str: &str,
     failed_times: &mut i32,
     counter: &Arc<AtomicI64>,
     protocol_type: u8,
     owner: u32,
     session: i64,
-    res: Result<DatabaseResponse, sqlx::Error>,
+    res: TiberiusResult<DatabaseResponse>,
 ) -> bool {
     match res {
-        Ok(rows) => {
-            moon_send(protocol_type, owner, session, rows);
+        Ok(response) => {
+            moon_send(protocol_type, owner, session, response);
             if *failed_times > 0 {
                 moon_log(
                     owner,
                     LOG_LEVEL_INFO,
                     format!(
                         "Database '{}' recover from error. Retry success.",
-                        database_url
+                        config_str
                     ),
                 );
             }
@@ -236,7 +207,7 @@ async fn handle_result(
                         LOG_LEVEL_ERROR,
                         format!(
                             "Database '{}' error: '{:?}'. Will retry.",
-                            database_url,
+                            config_str,
                             err.to_string()
                         ),
                     );
@@ -251,9 +222,9 @@ async fn handle_result(
 
 async fn database_handler(
     protocol_type: u8,
-    pool: &DatabasePool,
+    mut pool: DatabasePool,
     mut rx: mpsc::Receiver<DatabaseRequest>,
-    database_url: &str,
+    config_str: &str,
     counter: Arc<AtomicI64>,
 ) {
     while let Some(op) = rx.recv().await {
@@ -261,26 +232,39 @@ async fn database_handler(
         match &op {
             DatabaseRequest::Query(owner, session, query_op) => {
                 while handle_result(
-                    database_url,
+                    config_str,
                     &mut failed_times,
                     &counter,
                     protocol_type,
                     *owner,
                     *session,
-                    pool.query(query_op).await,
+                    pool.query(query_op).await.map(DatabaseResponse::Rows),
+                )
+                .await
+                {}
+            }
+            DatabaseRequest::Execute(owner, session, query_op) => {
+                while handle_result(
+                    config_str,
+                    &mut failed_times,
+                    &counter,
+                    protocol_type,
+                    *owner,
+                    *session,
+                    pool.execute(query_op).await.map(DatabaseResponse::Execute),
                 )
                 .await
                 {}
             }
             DatabaseRequest::Transaction(owner, session, query_ops) => {
                 while handle_result(
-                    database_url,
+                    config_str,
                     &mut failed_times,
                     &counter,
                     protocol_type,
                     *owner,
                     *session,
-                    pool.transaction(query_ops).await,
+                    pool.batch_execute(query_ops).await,
                 )
                 .await
                 {}
@@ -297,26 +281,32 @@ extern "C-unwind" fn connect(state: LuaState) -> i32 {
     let owner = laux::lua_get(state, 2);
     let session: i64 = laux::lua_get(state, 3);
 
-    let database_url: &str = laux::lua_get(state, 4);
+    let config_str: &str = laux::lua_get(state, 4);
     let name: &str = laux::lua_get(state, 5);
-    let connect_timeout: u64 = laux::lua_opt(state, 6).unwrap_or(5000);
+    let connect_timeout: u64 = laux::lua_opt(state, 6).unwrap_or(30000);
+
+    let config_str = config_str.to_string();
+    let name = name.to_string();
 
     CONTEXT.tokio_runtime.spawn(async move {
-        match DatabasePool::connect(database_url, Duration::from_millis(connect_timeout)).await {
+        println!("Attempting to connect to SQL Server with config: {}", config_str);
+        println!("Connection timeout set to: {} ms", connect_timeout);
+        match DatabasePool::connect(&config_str, Duration::from_millis(connect_timeout)).await {
             Ok(pool) => {
                 let (tx, rx) = mpsc::channel(100);
                 let counter = Arc::new(AtomicI64::new(0));
-                DATABASE_CONNECTIONSS.insert(
-                    name.to_string(),
+                DATABASE_CONNECTIONS.insert(
+                    name.clone(),
                     DatabaseConnection {
                         tx: tx.clone(),
                         counter: counter.clone(),
                     },
                 );
                 moon_send(protocol_type, owner, session, DatabaseResponse::Connect);
-                database_handler(protocol_type, &pool, rx, database_url, counter).await;
+                database_handler(protocol_type, pool, rx, &config_str, counter).await;
             }
             Err(err) => {
+                println!("SQL Server connection failed: {}", err);
                 moon_send(
                     protocol_type,
                     owner,
@@ -428,6 +418,59 @@ extern "C-unwind" fn query(state: LuaState) -> i32 {
     }
 }
 
+extern "C-unwind" fn execute(state: LuaState) -> i32 {
+    let mut args = LuaArgs::new(1);
+    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
+        .expect("Invalid database connect pointer");
+
+    let owner = laux::lua_get(state, args.iter_arg());
+    let session = laux::lua_get(state, args.iter_arg());
+
+    let sql = laux::lua_get::<&str>(state, args.iter_arg());
+    let mut params = Vec::new();
+    let top = laux::lua_top(state);
+    for i in args.iter_arg()..=top {
+        let param = get_query_param(state, i);
+        match param {
+            Ok(value) => {
+                params.push(value);
+            }
+            Err(err) => {
+                push_lua_table!(
+                    state,
+                    "kind" => "ERROR",
+                    "message" => err
+                );
+                return 1;
+            }
+        }
+    }
+
+    match conn.tx.try_send(DatabaseRequest::Execute(
+        owner,
+        session,
+        DatabaseQuery {
+            sql: sql.to_string(),
+            binds: params,
+        },
+    )) {
+        Ok(_) => {
+            conn.counter
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            laux::lua_push(state, session);
+            1
+        }
+        Err(err) => {
+            push_lua_table!(
+                state,
+                "kind" => "ERROR",
+                "message" => err.to_string()
+            );
+            1
+        }
+    }
+}
+
 struct TransactionQuerys {
     querys: Vec<DatabaseQuery>,
 }
@@ -464,7 +507,7 @@ extern "C-unwind" fn make_transaction(state: LuaState) -> i32 {
     laux::lua_newuserdata(
         state,
         TransactionQuerys { querys: Vec::new() },
-        cstr!("sqlx_transaction_metatable"),
+        cstr!("tiberius_transaction_metatable"),
         &[lreg!("push", push_transaction_query), lreg_null!()],
     );
     1
@@ -523,82 +566,40 @@ extern "C-unwind" fn close(state: LuaState) -> i32 {
     }
 }
 
-fn process_rows<'a, DB>(state: LuaState, rows: &'a [<DB as Database>::Row]) -> Result<i32, String>
-where
-    DB: sqlx::Database,
-    usize: ColumnIndex<<DB as Database>::Row>,
-    bool: sqlx::Decode<'a, DB>,
-    i64: sqlx::Decode<'a, DB>,
-    f64: sqlx::Decode<'a, DB>,
-    &'a str: sqlx::Decode<'a, DB>,
-    &'a [u8]: sqlx::Decode<'a, DB>,
-{
+fn process_rows(state: LuaState, rows: &[Row]) -> Result<i32, String> {
     let table = LuaTable::new(state, rows.len(), 0);
     if rows.is_empty() {
         return Ok(1);
     }
 
     let mut column_info = Vec::new();
-    if column_info.is_empty() {
-        rows.iter()
-            .next()
-            .unwrap()
-            .columns()
-            .iter()
-            .enumerate()
-            .for_each(|(index, column)| {
-                column_info.push((index, column.name()));
-            });
+    if let Some(first_row) = rows.first() {
+        for (index, column) in first_row.columns().iter().enumerate() {
+            column_info.push((index, column.name()));
+        }
     }
 
     let mut i = 0;
     for row in rows.iter() {
         let row_table = LuaTable::new(state, 0, row.len());
         for (index, column_name) in column_info.iter() {
-            match row.try_get_raw(*index) {
-                Ok(value) => match value.type_info().name() {
-                    "NULL" => {
-                        row_table.rawset(*column_name, LuaNil {});
-                    }
-                    "BOOL" | "BOOLEAN" => {
-                        row_table.rawset(
-                            *column_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(false),
-                        );
-                    }
-                    "INT2" | "INT4" | "INT8" | "TINYINT" | "SMALLINT" | "INT" | "MEDIUMINT"
-                    | "BIGINT" | "INTEGER" => {
-                        row_table.rawset(
-                            *column_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(0),
-                        );
-                    }
-                    "FLOAT4" | "FLOAT8" | "NUMERIC" | "FLOAT" | "DOUBLE" | "REAL" => {
-                        row_table.rawset(
-                            *column_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(0.0),
-                        );
-                    }
-                    "TEXT" => {
-                        row_table.rawset(
-                            *column_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(""),
-                        );
-                    }
-                    _ => {
-                        let column_value: &[u8] =
-                            sqlx::decode::Decode::decode(value).unwrap_or(b"");
-                        row_table.rawset(*column_name, column_value);
-                    }
-                },
-                Err(error) => {
-                    laux::lua_push(state, false);
-                    laux::lua_push(
-                        state,
-                        format!("{:?} decode error: {:?}", column_name, error),
-                    );
-                    return Ok(2);
-                }
+            // Try to get the value as string first
+            if let Ok(value) = row.try_get::<&str, _>(*index) {
+                row_table.rawset(*column_name, value.unwrap_or_default());
+            } else if let Ok(value) = row.try_get::<bool, _>(*index) {
+                row_table.rawset(*column_name, value.unwrap_or_default());
+            } else if let Ok(value) = row.try_get::<i32, _>(*index) {
+                row_table.rawset(*column_name, value.unwrap_or_default() as i64);
+            } else if let Ok(value) = row.try_get::<i64, _>(*index) {
+                row_table.rawset(*column_name, value.unwrap_or_default());
+            } else if let Ok(value) = row.try_get::<f32, _>(*index) {
+                row_table.rawset(*column_name, value.unwrap_or_default() as f64);
+            } else if let Ok(value) = row.try_get::<f64, _>(*index) {
+                row_table.rawset(*column_name, value.unwrap_or_default());
+            } else if let Ok(value) = row.try_get::<&[u8], _>(*index) {
+                row_table.rawset(*column_name, value.unwrap_or_default());
+            } else {
+                row_table.rawset(*column_name, LuaNil {});
             }
         }
         i += 1;
@@ -609,10 +610,11 @@ where
 
 extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
     let name = laux::lua_get::<&str>(state, 1);
-    match DATABASE_CONNECTIONSS.get(name) {
+    match DATABASE_CONNECTIONS.get(name) {
         Some(pair) => {
             let l = [
                 lreg!("query", query),
+                lreg!("execute", execute),
                 lreg!("transaction", transaction),
                 lreg!("close", close),
                 lreg_null!(),
@@ -620,7 +622,7 @@ extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
             if laux::lua_newuserdata(
                 state,
                 pair.value().clone(),
-                cstr!("sqlx_connection_metatable"),
+                cstr!("tiberius_connection_metatable"),
                 l.as_ref(),
             )
             .is_none()
@@ -640,9 +642,9 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
     laux::luaL_checkstack(state, 6, std::ptr::null());
     let result = lua_into_userdata::<DatabaseResponse>(state, 1);
 
-    match *result {
-        DatabaseResponse::PgRows(rows) => {
-            return process_rows::<Postgres>(state, &rows)
+    match &*result {
+        DatabaseResponse::Rows(rows) => {
+            return process_rows(state, rows)
                 .map_err(|e| {
                     push_lua_table!(
                         state,
@@ -652,27 +654,12 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
                 })
                 .unwrap_or(1);
         }
-        DatabaseResponse::MysqlRows(rows) => {
-            return process_rows::<MySql>(state, &rows)
-                .map_err(|e| {
-                    push_lua_table!(
-                        state,
-                        "kind" => "ERROR",
-                        "message" => e
-                    );
-                })
-                .unwrap_or(1);
-        }
-        DatabaseResponse::SqliteRows(rows) => {
-            return process_rows::<Sqlite>(state, &rows)
-                .map_err(|e| {
-                    push_lua_table!(
-                        state,
-                        "kind" => "ERROR",
-                        "message" => e
-                    );
-                })
-                .unwrap_or(1);
+        DatabaseResponse::Execute(count) => {
+            push_lua_table!(
+                state,
+                "affected_rows" => *count as i64
+            );
+            return 1;
         }
         DatabaseResponse::Transaction => {
             push_lua_table!(
@@ -688,22 +675,13 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
             );
             return 1;
         }
-        DatabaseResponse::Error(err) => match err.as_database_error() {
-            Some(db_err) => {
-                push_lua_table!(
-                    state,
-                    "kind" => "DB",
-                    "message" => db_err.message()
-                );
-            }
-            None => {
-                push_lua_table!(
-                    state,
-                    "kind" => "ERROR",
-                    "message" => err.to_string()
-                );
-            }
-        },
+        DatabaseResponse::Error(err) => {
+            push_lua_table!(
+                state,
+                "kind" => "ERROR",
+                "message" => err.to_string()
+            );
+        }
         DatabaseResponse::Timeout(err) => {
             push_lua_table!(
                 state,
@@ -717,8 +695,8 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
 }
 
 extern "C-unwind" fn stats(state: LuaState) -> i32 {
-    let table = LuaTable::new(state, 0, DATABASE_CONNECTIONSS.len());
-    DATABASE_CONNECTIONSS.iter().for_each(|pair| {
+    let table = LuaTable::new(state, 0, DATABASE_CONNECTIONS.len());
+    DATABASE_CONNECTIONS.iter().for_each(|pair| {
         table.rawset(
             pair.key().as_str(),
             pair.value()
@@ -729,10 +707,10 @@ extern "C-unwind" fn stats(state: LuaState) -> i32 {
     1
 }
 
-#[cfg(feature = "sqlx")]
+#[cfg(feature = "tiberius")]
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C-unwind" fn luaopen_rust_sqlx(state: LuaState) -> i32 {
+pub extern "C-unwind" fn luaopen_rust_tiberius(state: LuaState) -> i32 {
     let l = [
         lreg!("connect", connect),
         lreg!("find_connection", find_connection),

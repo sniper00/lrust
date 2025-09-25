@@ -584,6 +584,7 @@ extern "C-unwind" fn concat_resp(state: LuaState) -> i32 {
 /// This function is unsafe because it dereferences a raw pointer `state`.
 /// The caller must ensure that `state` is a valid pointer to a `lua_State`
 /// and that it remains valid for the duration of the function call.
+#[cfg(feature = "json")]
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C-unwind" fn luaopen_json(state: LuaState) -> i32 {
