@@ -2,6 +2,8 @@
 
 This library provides Lua extensions for [Moon](https://github.com/sniper00/moon), implemented in Rust . By using Rust, we can use its ecosystem, including the `tokio` runtime.
 
+> Add extension library: `premake5 add --package=https://github.com/sniper00/lrust.git`
+
 - [Libraries](#libraries)
     - [Rust](#rust)
         - [1. Excel Reader](#1-excel-reader)
