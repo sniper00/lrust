@@ -2,6 +2,8 @@
 
 This library provides Lua extensions for [Moon](https://github.com/sniper00/moon), implemented in Rust . By using Rust, we can use its ecosystem, including the `tokio` runtime.
 
+**To compile this extension, you need to install the [Rust environment](https://www.rust-lang.org/).**
+
 > Add extension library: `premake5 add --package=https://github.com/sniper00/lrust.git`
 
 - [Libraries](#libraries)
@@ -428,7 +430,7 @@ print("\n=== Test Complete ===")
 
 ### 6. SqlServer
 
-Modify lib-lualib/Cargo.toml to enable tiberius feature。
+Modify `lib-lualib/Cargo.toml` to enable tiberius feature。
 
 ```
 [features]
