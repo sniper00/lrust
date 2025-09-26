@@ -430,11 +430,11 @@ print("\n=== Test Complete ===")
 
 ### 6. SqlServer
 
-Modify `lib-lualib/Cargo.toml` to enable tiberius feature。
+Modify `lib-lualib/Cargo.toml` to enable `tiberius` feature。
 
 ```
 [features]
-default = ["excel", "sqlx", "mongodb", "websocket", "http", "json", tiberius]
+default = ["excel", "sqlx", "mongodb", "websocket", "http", "json", "tiberius"]
 ```
 
 ```lua
