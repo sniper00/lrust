@@ -64,14 +64,19 @@ function M:execute(sql, ...)
     end
 end
 
+--- Execute multiple queries, delimited with `;` and return multiple result sets; one for each query.
+--- Do not use this with any user specified input. Please resort to prepared statements using the [`query`] method.
 ---@async
 ---@nodiscard
----@param querys table
+---@param querys string[]
 ---@return table
 function M:transaction(querys)
     local trans = c.make_transaction()
     for _, v in ipairs(querys) do
-        trans:push(table.unpack(v))
+        if type(v) ~= "string" then
+            error("Each query must be a string, not support input params")
+        end
+        trans:push(table.unpack({v}))
     end
     local session = self.obj:transaction(moon.id, moon.next_sequence(), trans)
     if type(session) == "table" then
@@ -80,11 +85,16 @@ function M:transaction(querys)
     return moon.wait(session)
 end
 
----@param querys table
+--- Execute multiple queries, delimited with `;` and return multiple result sets; one for each query.
+--- Do not use this with any user specified input. Please resort to prepared statements using the [`query`] method.
+---@param querys string[]
 function M:execute_transaction(querys)
     local trans = c.make_transaction()
     for _, v in ipairs(querys) do
-        trans:push(table.unpack(v))
+        if type(v) ~= "string" then
+            error("Each query must be a string, not support input params")
+        end
+        trans:push(table.unpack({v}))
     end
     local res = self.obj:transaction(moon.id, 0, trans)
     if type(res) == "table" then

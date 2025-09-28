@@ -109,26 +109,25 @@ impl DatabasePool {
         Ok(result.total())
     }
 
-    async fn batch_execute(&mut self, requests: &[DatabaseQuery]) -> TiberiusResult<DatabaseResponse> {
+    async fn batch_execute(&mut self, requests: &[DatabaseQuery]) -> TiberiusResult<Vec<Row>> {
+        let mut query = String::new();
         // Execute queries in batch without transaction
         for request in requests {
-            let mut query = tiberius::Query::new(&request.sql);
-            
-            for param in request.binds.iter() {
-                match param {
-                    QueryParams::Bool(val) => query.bind(*val),
-                    QueryParams::Int(val) => query.bind(*val),
-                    QueryParams::Float(val) => query.bind(*val),
-                    QueryParams::Text(val) => query.bind(val.as_str()),
-                    QueryParams::Json(val) => query.bind(serde_json::to_string(val).unwrap()),
-                    QueryParams::Bytes(val) => query.bind(val.as_slice()),
-                }
+            query.push_str(&request.sql);
+            if !request.sql.trim_end().ends_with(';') {
+                query.push(';');
             }
-            
-            query.execute(&mut self.client).await?;
+        }
+
+        let stream = self.client.simple_query(query).await?;
+        let result = stream.into_results().await?;
+        
+        let mut rows = Vec::new();
+        for row_set in result {
+            rows.extend(row_set);
         }
         
-        Ok(DatabaseResponse::Transaction)
+        Ok(rows)
     }
 }
 
@@ -151,7 +150,6 @@ enum DatabaseResponse {
     Execute(u64),
     Error(tiberius::error::Error),
     Timeout(String),
-    Transaction,
 }
 
 #[derive(Debug, Clone)]
@@ -264,7 +262,7 @@ async fn database_handler(
                     protocol_type,
                     *owner,
                     *session,
-                    pool.batch_execute(query_ops).await,
+                    pool.batch_execute(query_ops).await.map(DatabaseResponse::Rows),
                 )
                 .await
                 {}
@@ -658,13 +656,6 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
             push_lua_table!(
                 state,
                 "affected_rows" => *count as i64
-            );
-            return 1;
-        }
-        DatabaseResponse::Transaction => {
-            push_lua_table!(
-                state,
-                "message" => "ok"
             );
             return 1;
         }
