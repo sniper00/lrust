@@ -67,7 +67,7 @@ fn aes_encrypt_imp(state: LuaState) -> Result<i32> {
     let mut in_out = data.to_vec();
     let tag = sealing_key
         .seal_in_place_separate_tag(Aad::empty(), &mut in_out)
-        .map_err(|err| anyhow!(format!("Encryption failed: {0}", err.to_string())))?;
+        .map_err(|err| anyhow!(format!("Encryption failed: {0}", err)))?;
 
     // Combine ciphertext and tag
     in_out.extend_from_slice(tag.as_ref());
@@ -125,7 +125,7 @@ fn aes_decrypt_imp(state: LuaState) -> Result<i32> {
     let mut in_out = encrypted_data.to_vec();
     let plaintext = opening_key
         .open_in_place(Aad::empty(), &mut in_out)
-        .map_err(|err| anyhow!(format!("Decryption failed: {}", err.to_string())))?;
+        .map_err(|err| anyhow!(format!("Decryption failed: {}", err)))?;
 
     laux::lua_push(state, plaintext as &[u8]);
     Ok(1)
