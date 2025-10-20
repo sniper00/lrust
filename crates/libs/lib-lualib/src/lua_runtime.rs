@@ -13,7 +13,7 @@ extern "C-unwind" fn num_alive_tasks(state: LuaState) -> i32 {
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_rust_runtime(state: LuaState) -> i32 {
     let l = [lreg!("num_alive_tasks", num_alive_tasks), lreg_null!()];

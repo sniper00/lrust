@@ -752,7 +752,7 @@ extern "C-unwind" fn operators(state: LuaState) -> i32 {
 }
 
 extern "C-unwind" fn decode(state: LuaState) -> i32 {
-    laux::luaL_checkstack(state, 6, std::ptr::null());
+    laux::lua_checkstack(state, 6, std::ptr::null());
     let result = laux::lua_into_userdata::<DatabaseResponse>(state, 1);
     match *result {
         DatabaseResponse::Connect => {
@@ -808,8 +808,8 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
         }
         DatabaseResponse::UpdateOne(res) | DatabaseResponse::UpdateMany(res) => {
             let table = LuaTable::new(state, 0, 3);
-            table.rawset("matched_count", res.matched_count);
-            table.rawset("modified_count", res.modified_count);
+            table.insert("matched_count", res.matched_count);
+            table.insert("modified_count", res.modified_count);
 
             if let Some(id) = res.upserted_id {
                 laux::lua_push(state, "upserted_id");
@@ -847,7 +847,7 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
                     );
                     return 1;
                 }
-                table.seti(i + 1);
+                table.rawseti(i + 1);
             }
             1
         }
@@ -1022,7 +1022,7 @@ fn bson_to_lua(state: LuaState, value: &Bson) -> Result<(), String> {
 }
 
 #[cfg(feature = "mongodb")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_rust_mongodb(state: LuaState) -> i32 {
     let l = [

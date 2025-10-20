@@ -323,19 +323,19 @@ fn version_to_string(version: &reqwest::Version) -> &str {
 }
 
 extern "C-unwind" fn decode(state: LuaState) -> i32 {
-    laux::luaL_checkstack(state, 6, std::ptr::null());
+    laux::lua_checkstack(state, 6, std::ptr::null());
     let response = lua_into_userdata::<WsResponse>(state, 1);
     match *response {
         WsResponse::Connect(id, response) => {
             LuaTable::new(state, 0, 6)
-                .rawset("fd", id)
-                .rawset("version", version_to_string(&response.version()))
-                .rawset("status_code", response.status().as_u16())
-                .rawset("body", response.body().as_deref().unwrap_or_default())
-                .rawset_x("headers", || {
+                .insert("fd", id)
+                .insert("version", version_to_string(&response.version()))
+                .insert("status_code", response.status().as_u16())
+                .insert("body", response.body().as_deref().unwrap_or_default())
+                .insert_x("headers", || {
                     let headers = LuaTable::new(state, 0, response.headers().len());
                     for (key, value) in response.headers().iter() {
-                        headers.rawset(key.as_str(), value.to_str().unwrap_or("").trim());
+                        headers.insert(key.as_str(), value.to_str().unwrap_or("").trim());
                     }
                 });
             1
@@ -355,7 +355,7 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
 }
 
 #[cfg(feature = "websocket")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C-unwind" fn luaopen_rust_websocket(state: LuaState) -> i32 {
     let l = [
         lreg!("connect", lconnect),

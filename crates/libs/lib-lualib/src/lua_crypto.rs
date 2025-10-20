@@ -83,7 +83,7 @@ extern "C-unwind" fn aes_encrypt(state: LuaState) -> i32 {
     match aes_encrypt_imp(state) {
         Ok(n) => n,
         Err(e) => {
-            laux::lua_error(state, e.to_string().as_str());
+            laux::lua_error(state, e.to_string());
         }
     }
 }
@@ -135,7 +135,7 @@ extern "C-unwind" fn aes_decrypt(state: LuaState) -> i32 {
     match aes_decrypt_imp(state) {
         Ok(n) => n,
         Err(e) => {
-            laux::lua_error(state, e.to_string().as_str());
+            laux::lua_error(state, e.to_string());
         }
     }
 }
@@ -147,7 +147,7 @@ extern "C-unwind" fn generate_key(state: LuaState) -> i32 {
     let key_size = laux::lua_opt(state, 1).unwrap_or(32);
 
     if key_size == 0 || key_size > 64 {
-        laux::lua_error(state, "Key size must be between 1 and 64 bytes");
+        laux::lua_error(state, "Key size must be between 1 and 64 bytes".to_string());
     }
 
     let rng = SystemRandom::new();
@@ -158,7 +158,7 @@ extern "C-unwind" fn generate_key(state: LuaState) -> i32 {
             1
         }
         Err(_) => {
-            laux::lua_error(state, "Failed to generate random key");
+            laux::lua_error(state, "Failed to generate random key".to_string());
         }
     }
 }
@@ -175,12 +175,12 @@ extern "C-unwind" fn generate_nonce(state: LuaState) -> i32 {
             1
         }
         Err(_) => {
-            laux::lua_error(state, "Failed to generate random key");
+            laux::lua_error(state, "Failed to generate random nonce".to_string());
         }
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_rust_crypto(state: LuaState) -> i32 {
     let l = [

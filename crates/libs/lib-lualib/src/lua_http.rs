@@ -142,18 +142,18 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
 }
 
 extern "C-unwind" fn decode(state: LuaState) -> i32 {
-    laux::luaL_checkstack(state, 4, std::ptr::null());
+    laux::lua_checkstack(state, 4, std::ptr::null());
     let p_as_isize: isize = laux::lua_get(state, 1);
     let response = unsafe { Box::from_raw(p_as_isize as *mut HttpResponse) };
 
     LuaTable::new(state, 0, 6)
-        .rawset("version", version_to_string(&response.version))
-        .rawset("status_code", response.status_code)
-        .rawset("body", response.body.as_ref())
-        .rawset_x("headers", || {
+        .insert("version", version_to_string(&response.version))
+        .insert("status_code", response.status_code)
+        .insert("body", response.body.as_ref())
+        .insert_x("headers", || {
             let headers = LuaTable::new(state, 0, response.headers.len());
             for (key, value) in response.headers.iter() {
-                headers.rawset(key.as_str(), value.to_str().unwrap_or("").trim());
+                headers.insert(key.as_str(), value.to_str().unwrap_or("").trim());
             }
         });
     1
@@ -193,13 +193,13 @@ extern "C-unwind" fn lua_http_form_urldecode(state: LuaState) -> i32 {
     let table = LuaTable::new(state, 0, decoded.len());
 
     for (key, value) in decoded {
-        table.rawset(key, value);
+        table.insert(key, value);
     }
     1
 }
 
 #[cfg(feature = "http")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_rust_httpc(state: LuaState) -> i32 {
     let l = [

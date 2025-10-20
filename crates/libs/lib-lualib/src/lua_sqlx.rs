@@ -1,23 +1,23 @@
-use crate::lua_json::{encode_table, JsonOptions};
-use crate::{moon_log, moon_send, LOG_LEVEL_ERROR, LOG_LEVEL_INFO};
+use crate::lua_json::{JsonOptions, encode_table};
+use crate::{LOG_LEVEL_ERROR, LOG_LEVEL_INFO, moon_log, moon_send};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use lib_core::context::CONTEXT;
-use lib_lua::laux::{lua_into_userdata, LuaArgs, LuaNil, LuaState, LuaTable, LuaValue};
+use lib_lua::laux::{LuaArgs, LuaNil, LuaState, LuaTable, LuaValue, lua_into_userdata};
 use lib_lua::luaL_newlib;
 use lib_lua::{self, cstr, ffi, laux, lreg, lreg_null, push_lua_table};
+use sqlx::ColumnIndex;
+use sqlx::ValueRef;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::mysql::MySqlRow;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::sqlite::SqliteRow;
-use sqlx::ColumnIndex;
-use sqlx::ValueRef;
 use sqlx::{
     Column, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo,
 };
 
-use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -44,10 +44,7 @@ impl DatabasePool {
             timeout(timeout_duration, connect_future)
                 .await
                 .map_err(|err| {
-                    sqlx::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Connection error: {}", err),
-                    ))
+                    sqlx::Error::Io(std::io::Error::other(format!("Connection error: {}", err)))
                 })?
         }
 
@@ -353,7 +350,7 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
             let mut buffer = Vec::new();
             if let Err(err) = encode_table(&mut buffer, &val, 0, false, &options) {
                 drop(buffer);
-                laux::lua_error(state, &err);
+                laux::lua_error(state, err);
             }
             if buffer[0] == b'{' || buffer[0] == b'[' {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(buffer.as_slice()) {
@@ -447,7 +444,7 @@ extern "C-unwind" fn push_transaction_query(state: LuaState) -> i32 {
             }
             Err(err) => {
                 drop(params);
-                laux::lua_error(state, err.as_ref());
+                laux::lua_error(state, err);
             }
         }
     }
@@ -558,29 +555,29 @@ where
             match row.try_get_raw(*index) {
                 Ok(value) => match value.type_info().name() {
                     "NULL" => {
-                        row_table.rawset(*column_name, LuaNil {});
+                        row_table.insert(*column_name, LuaNil {});
                     }
                     "BOOL" | "BOOLEAN" => {
-                        row_table.rawset(
+                        row_table.insert(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(false),
                         );
                     }
                     "INT2" | "INT4" | "INT8" | "TINYINT" | "SMALLINT" | "INT" | "MEDIUMINT"
                     | "BIGINT" | "INTEGER" => {
-                        row_table.rawset(
+                        row_table.insert(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(0),
                         );
                     }
                     "FLOAT4" | "FLOAT8" | "NUMERIC" | "FLOAT" | "DOUBLE" | "REAL" => {
-                        row_table.rawset(
+                        row_table.insert(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(0.0),
                         );
                     }
                     "TEXT" => {
-                        row_table.rawset(
+                        row_table.insert(
                             *column_name,
                             sqlx::decode::Decode::decode(value).unwrap_or(""),
                         );
@@ -588,7 +585,7 @@ where
                     _ => {
                         let column_value: &[u8] =
                             sqlx::decode::Decode::decode(value).unwrap_or(b"");
-                        row_table.rawset(*column_name, column_value);
+                        row_table.insert(*column_name, column_value);
                     }
                 },
                 Err(error) => {
@@ -602,7 +599,7 @@ where
             }
         }
         i += 1;
-        table.seti(i);
+        table.rawseti(i);
     }
     Ok(1)
 }
@@ -637,7 +634,7 @@ extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
 }
 
 extern "C-unwind" fn decode(state: LuaState) -> i32 {
-    laux::luaL_checkstack(state, 6, std::ptr::null());
+    laux::lua_checkstack(state, 6, std::ptr::null());
     let result = lua_into_userdata::<DatabaseResponse>(state, 1);
 
     match *result {
@@ -719,7 +716,7 @@ extern "C-unwind" fn decode(state: LuaState) -> i32 {
 extern "C-unwind" fn stats(state: LuaState) -> i32 {
     let table = LuaTable::new(state, 0, DATABASE_CONNECTIONSS.len());
     DATABASE_CONNECTIONSS.iter().for_each(|pair| {
-        table.rawset(
+        table.insert(
             pair.key().as_str(),
             pair.value()
                 .counter
@@ -730,7 +727,7 @@ extern "C-unwind" fn stats(state: LuaState) -> i32 {
 }
 
 #[cfg(feature = "sqlx")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C-unwind" fn luaopen_rust_sqlx(state: LuaState) -> i32 {
     let l = [

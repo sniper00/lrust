@@ -1,9 +1,6 @@
 use crate::{ffi, lua_State};
 use std::{
-    ffi::{c_char, c_int},
-    fmt::{Display, Formatter},
-    marker::PhantomData,
-    ptr::NonNull,
+    cell::Cell, ffi::{c_char, c_int}, fmt::{Display, Formatter}, marker::PhantomData, ptr::NonNull
 };
 
 pub type LuaState = NonNull<ffi::lua_State>;
@@ -226,36 +223,34 @@ impl LuaStack for LuaNil {
 }
 
 #[derive(PartialEq)]
-pub struct LuaThread(pub LuaState);
+pub struct LuaThread(pub *mut ffi::lua_State);
 
 unsafe impl Send for LuaThread {}
 
 impl LuaThread {
-    pub fn new(l: LuaState) -> Self {
+    pub fn new(l: *mut ffi::lua_State) -> Self {
         LuaThread(l)
     }
 }
 
-// #[derive(PartialEq)]
-// pub struct LuaStateBox(pub LuaState);
+#[derive(PartialEq)]
+pub struct LuaStateBox(pub LuaState);
 
-// unsafe impl Send for LuaStateBox {}
+unsafe impl Send for LuaStateBox {}
 
-// impl LuaStateBox {
-//     pub fn new(l: LuaState) -> Self {
-//         LuaStateBox(l)
-//     }
-// }
+impl LuaStateBox {
+    pub fn new(l: LuaState) -> Self {
+        LuaStateBox(l)
+    }
+}
 
-// impl Drop for LuaStateBox {
-//     fn drop(&mut self) {
-//         unsafe {
-//             if !self.0.is_null() {
-//                 ffi::lua_close(self.0);
-//             }
-//         }
-//     }
-// }
+impl Drop for LuaStateBox {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::lua_close(self.0.as_ptr());
+        }
+    }
+}
 
 pub extern "C-unwind" fn lua_null_function(_: LuaState) -> i32 {
     0
@@ -396,24 +391,30 @@ pub fn lua_type(state: LuaState, index: i32) -> LuaType {
     }
 }
 
-pub fn lua_error(state: LuaState, message: &str) -> ! {
+pub fn lua_error(state: LuaState, message: String) -> ! {
     unsafe {
         ffi::lua_pushlstring(
             state.as_ptr(),
             message.as_ptr() as *const c_char,
             message.len(),
         );
+        drop(message);
         ffi::lua_error(state.as_ptr())
     }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn lua_arg_error(state: LuaState, index: i32, extra_msg: *const c_char) -> i32 {
+    unsafe { ffi::luaL_argerror(state.as_ptr(), index, extra_msg) }
 }
 
 pub fn throw_error(state: LuaState) -> ! {
     unsafe { ffi::lua_error(state.as_ptr()) }
 }
 
-pub fn type_name(state: LuaState, idx: i32) -> &'static str {
+pub fn type_name(state: LuaState, t: i32) -> &'static str {
     unsafe {
-        std::ffi::CStr::from_ptr(ffi::lua_typename(state.as_ptr(), idx))
+        std::ffi::CStr::from_ptr(ffi::lua_typename(state.as_ptr(), t))
             .to_str()
             .unwrap_or_default()
     }
@@ -452,7 +453,7 @@ pub fn lua_checktype(state: LuaState, index: i32, ltype: i32) {
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn luaL_checkstack(state: LuaState, sz: i32, msg: *const c_char) {
+pub fn lua_checkstack(state: LuaState, sz: i32, msg: *const c_char) {
     unsafe {
         ffi::luaL_checkstack(state.as_ptr(), sz, msg);
     }
@@ -465,6 +466,10 @@ pub fn lua_as_slice(state: LuaState, index: i32) -> &'static [u8] {
         let ptr = ffi::luaL_tolstring(state.as_ptr(), index, &mut len);
         std::slice::from_raw_parts(ptr as *const u8, len)
     }
+}
+
+pub fn lua_absindex(state: LuaState, index: i32) -> i32 {
+    unsafe { ffi::lua_absindex(state.as_ptr(), index) }
 }
 
 #[inline(always)]
@@ -544,6 +549,7 @@ pub fn lua_into_userdata<T>(state: LuaState, index: i32) -> Box<T> {
 pub struct LuaTable {
     state: LuaState,
     index: i32,
+    pos: Cell<u32>
 }
 
 impl LuaTable {
@@ -553,15 +559,18 @@ impl LuaTable {
             LuaTable {
                 state,
                 index: ffi::lua_gettop(state.as_ptr()),
+                pos: Cell::new(0)
             }
         }
     }
 
-    pub fn from_stack(state: LuaState, mut index: i32) -> Self {
-        if index < 0 {
-            index = unsafe { ffi::lua_gettop(state.as_ptr()) + index + 1 };
-        }
-        LuaTable { state, index }
+    pub fn from_stack(state: LuaState, index: i32) -> Self {
+        LuaTable { state, index: lua_absindex(state, index), pos: Cell::new(0) }
+    }
+
+    pub fn array_from_stack(state: LuaState, index: i32) -> Self {
+        let len = unsafe { ffi::lua_rawlen(state.as_ptr(), index) };
+        LuaTable { state, index: lua_absindex(state, index), pos: Cell::new(len as u32) }
     }
 
     pub fn len(&self) -> usize {
@@ -584,13 +593,7 @@ impl LuaTable {
         self.len() == 0
     }
 
-    pub fn seti(&self, n: usize) {
-        unsafe {
-            ffi::lua_rawseti(self.state.as_ptr(), self.index, n as ffi::lua_Integer);
-        }
-    }
-
-    pub fn rawset<K, V>(&self, key: K, val: V) -> &Self
+    pub fn insert<K, V>(&self, key: K, val: V) -> &Self
     where
         K: LuaStack,
         V: LuaStack,
@@ -603,7 +606,43 @@ impl LuaTable {
         self
     }
 
-    pub fn rawset_x<K, F>(&self, key: K, f: F) -> &Self
+    pub fn push<V>(&self, val: V) -> &Self
+    where
+        V: LuaStack,
+    {
+        unsafe {
+            V::push(self.state, val);
+            self.pos.set(self.pos.get() + 1);
+            ffi::lua_rawseti(self.state.as_ptr(), self.index, self.pos.get() as ffi::lua_Integer);
+        }
+        self
+    }
+
+    pub fn push_table(&self, table: LuaTable) -> &Self
+    {
+        debug_assert!(table.index == lua_top(self.state));
+        unsafe {
+            ffi::lua_rawseti(self.state.as_ptr(), self.index, self.pos.get() as ffi::lua_Integer);
+        }
+        self
+    }
+
+    pub fn rawseti(&self, n: usize) {
+        unsafe {
+            ffi::lua_rawseti(self.state.as_ptr(), self.index, n as ffi::lua_Integer);
+        }
+    }
+
+    /// Pops the value from the top of the stack and sets it in the table at the specified key.
+    pub fn insert_from_stack(&self) -> &Self
+    {
+        unsafe {
+            ffi::lua_rawset(self.state.as_ptr(), self.index);
+        }
+        self
+    }
+
+    pub fn insert_x<K, F>(&self, key: K, f: F) -> &Self
     where
         K: LuaStack,
         F: FnOnce(),
@@ -616,7 +655,7 @@ impl LuaTable {
         self
     }
 
-    pub fn rawget<K>(&self, key: K) -> LuaScopeValue
+    pub fn rawget<K>(&self, key: K) -> LuaScopeValue<'_>
     where
         K: LuaStack,
     {
@@ -633,7 +672,7 @@ impl LuaTable {
 
     #[inline(always)]
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn getmetafield(&self, e: *const c_char) -> Option<LuaScopeValue> {
+    pub fn getmetafield(&self, e: *const c_char) -> Option<LuaScopeValue<'_>> {
         unsafe {
             if ffi::luaL_getmetafield(self.state.as_ptr(), self.index, e) == ffi::LUA_TNIL {
                 None
@@ -647,7 +686,7 @@ impl LuaTable {
         }
     }
 
-    pub fn iter(&self) -> LuaTableIterator {
+    pub fn iter(&self) -> LuaTableIterator<'_> {
         unsafe {
             ffi::lua_pushnil(self.state.as_ptr());
         }
@@ -658,7 +697,7 @@ impl LuaTable {
         }
     }
 
-    pub fn array_iter(&self) -> LuaArrayIterator {
+    pub fn array_iter(&self) -> LuaArrayIterator<'_> {
         LuaArrayIterator {
             table: self,
             pos: 0,
@@ -668,7 +707,7 @@ impl LuaTable {
         }
     }
 
-    pub fn expected_array_iter(&self, len: usize) -> LuaArrayIterator {
+    pub fn expected_array_iter(&self, len: usize) -> LuaArrayIterator<'_> {
         LuaArrayIterator {
             table: self,
             pos: 0,
@@ -676,6 +715,28 @@ impl LuaTable {
             has_value: false,
             _marker: PhantomData,
         }
+    }
+}
+
+impl LuaStack for LuaTable {
+    fn from_checked(state: LuaState, index: i32) -> LuaTable {
+        lua_checktype(state, index, ffi::LUA_TTABLE);
+        LuaTable::from_stack(state, index)
+    }
+
+    fn from_unchecked(state: LuaState, index: i32) -> LuaTable {
+        LuaTable::from_stack(state, index)
+    }
+
+    fn from_opt(state: LuaState, index: i32) -> Option<LuaTable> {
+        if lua_type(state, index) != LuaType::Table {
+            return None;
+        }
+        Some(LuaTable::from_stack(state, index))
+    }
+
+    fn push(_: LuaState, _: LuaTable) {
+
     }
 }
 
