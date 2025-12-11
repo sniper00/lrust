@@ -953,9 +953,9 @@ fn table_to_doc(table: LuaTable) -> Result<Document, String> {
 
 fn table_to_bson(table: LuaTable) -> Result<Bson, String> {
     let len = table.array_len();
-    if len > 0 {
-        let mut arr = Vec::with_capacity(len);
-        for val in table.expected_array_iter(len) {
+    if len.0 {
+        let mut arr = Vec::with_capacity(len.1);
+        for val in table.expected_array_iter(len.1) {
             arr.push(lua_to_bson(val, false)?);
         }
         return Ok(Bson::Array(arr));

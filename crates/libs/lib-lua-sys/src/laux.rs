@@ -1,4 +1,4 @@
-use crate::{ffi, lua_State};
+use crate::{ffi, lua_State, lua_rawlen};
 use std::{
     cell::Cell, ffi::{c_char, c_int}, fmt::{Display, Formatter}, marker::PhantomData, ptr::NonNull
 };
@@ -80,6 +80,32 @@ impl LuaStack for f64 {
     }
 
     fn push(state: LuaState, v: f64) {
+        unsafe {
+            ffi::lua_pushnumber(state.as_ptr(), v as ffi::lua_Number);
+        }
+    }
+}
+
+impl LuaStack for f32 {
+    fn from_checked(state: LuaState, index: i32) -> f32 {
+        unsafe { ffi::luaL_checknumber(state.as_ptr(), index) as f32 }
+    }
+
+    fn from_unchecked(state: LuaState, index: i32) -> f32 {
+        unsafe { ffi::lua_tonumber(state.as_ptr(), index) as f32 }
+    }
+
+    fn from_opt(state: LuaState, index: i32) -> Option<f32> {
+        unsafe {
+            if ffi::lua_isnumber(state.as_ptr(), index) == 0 {
+                None
+            } else {
+                Some(ffi::lua_tonumber(state.as_ptr(), index) as f32)
+            }
+        }
+    }
+
+    fn push(state: LuaState, v: f32) {
         unsafe {
             ffi::lua_pushnumber(state.as_ptr(), v as ffi::lua_Number);
         }
@@ -577,7 +603,7 @@ impl LuaTable {
         unsafe { ffi::lua_rawlen(self.state.as_ptr(), self.index) }
     }
 
-    pub fn array_len(&self) -> usize {
+    pub fn array_len(&self) -> (bool, usize) {
         lua_array_size(self.state, self.index)
     }
 
@@ -701,7 +727,7 @@ impl LuaTable {
         LuaArrayIterator {
             table: self,
             pos: 0,
-            len: self.array_len(),
+            len: self.array_len().1,
             has_value: false,
             _marker: PhantomData,
         }
@@ -825,11 +851,24 @@ impl Drop for LuaArrayIterator<'_> {
     }
 }
 
-pub fn lua_array_size(state: LuaState, idx: i32) -> usize {
+pub fn lua_array_size(state: LuaState, idx: i32) -> (bool, usize) {
     unsafe {
+        if ffi::luaL_getmetafield(state.as_ptr(), idx, cstr!("__array")) != ffi::LUA_TNIL {
+            ffi::lua_pop(state.as_ptr(), 1);
+            return (true, lua_rawlen(state.as_ptr(), idx));
+        }
+
+        if ffi::luaL_getmetafield(state.as_ptr(), idx, cstr!("__object")) != ffi::LUA_TNIL {
+            ffi::lua_pop(state.as_ptr(), 1);
+            return (false, 0);
+        }
+
+        let len = lua_rawlen(state.as_ptr(), idx);
+
+        // test first key
         ffi::lua_pushnil(state.as_ptr());
-        if ffi::lua_next(state.as_ptr(), idx) == 0 {
-            return 0;
+        if ffi::lua_next(state.as_ptr(), idx) == 0 { // empty table
+            return (false, 0);
         }
 
         let first_key = if ffi::lua_isinteger(state.as_ptr(), -2) != 0 {
@@ -841,7 +880,7 @@ pub fn lua_array_size(state: LuaState, idx: i32) -> usize {
         ffi::lua_pop(state.as_ptr(), 2);
 
         if first_key <= 0 {
-            return 0;
+            return (false, 0);
         } else if first_key == 1 {
             /*
              * https://www.lua.org/manual/5.4/manual.html#3.4.7
@@ -849,17 +888,16 @@ pub fn lua_array_size(state: LuaState, idx: i32) -> usize {
              * A border in a table t is any natural number that satisfies the following condition :
              * (border == 0 or t[border] ~= nil) and t[border + 1] == nil
              */
-            let len = ffi::lua_rawlen(state.as_ptr(), idx) as ffi::lua_Integer;
-            ffi::lua_pushinteger(state.as_ptr(), len);
+            ffi::lua_pushinteger(state.as_ptr(), len as i64);
             if ffi::lua_next(state.as_ptr(), idx) != 0 {
                 ffi::lua_pop(state.as_ptr(), 2);
-                return 0;
+                return (false, 0);
             }
         }
 
         let len = ffi::lua_rawlen(state.as_ptr(), idx) as ffi::lua_Integer;
         if first_key > len {
-            return 0;
+            return (false, 0);
         }
 
         ffi::lua_pushnil(state.as_ptr());
@@ -872,10 +910,10 @@ pub fn lua_array_size(state: LuaState, idx: i32) -> usize {
                 }
             }
             ffi::lua_pop(state.as_ptr(), 2);
-            return 0;
+            return (false, 0);
         }
 
-        len as usize
+        (true, len as usize)
     }
 }
 

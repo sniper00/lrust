@@ -271,8 +271,8 @@ pub fn encode_table(
 
     laux::lua_checkstack(table.lua_state(), 6, cstr!("json.encode.table"));
     let arr_size = table.array_len();
-    if arr_size > 0 {
-        encode_array(writer, table, arr_size, depth, fmt, options)?;
+    if arr_size.0 {
+        encode_array(writer, table, arr_size.1, depth, fmt, options)?;
     } else {
         encode_object(writer, table, depth, fmt, options)?;
     }

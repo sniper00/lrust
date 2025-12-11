@@ -8,7 +8,7 @@ build = "build.rs"
 [features]
 default = ["excel", "sqlx", "mongodb", "websocket", "http", "json"]
 excel = ["dep:calamine", "dep:csv"]
-sqlx = ["dep:sqlx"]
+sqlx = ["dep:sqlx", "dep:chrono"]
 mongodb = ["dep:mongodb", "dep:futures"]
 websocket = ["dep:tokio-tungstenite", "dep:futures", "dep:futures-util"]
 http = ["dep:reqwest", "dep:percent-encoding", "dep:form_urlencoded", "dep:url", "json"]
@@ -26,7 +26,7 @@ lib-core = { path = "../../libs/lib-core"}
 lib-lua = {package = "lib-lua-sys", path = "../../libs/lib-lua-sys",features = ["lua54"]}
 tokio = { version = "1", features = ["full"] }
 log = "0.4.0"
-calamine = { version = "^0.31", optional = true }
+calamine = { version = "0.32", optional = true }
 csv = { version = "1.3.0", optional = true }
 
 bytes = "1.5.0"
@@ -39,7 +39,8 @@ percent-encoding = { version = "2.3.1", optional = true}
 form_urlencoded = { version = "1.2.1", optional = true}
 url = { version = "2.5.0", optional = true}
 
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "mysql"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "mysql", "chrono", "uuid"], optional = true }
+chrono = { version = "0.4", optional = true }
 mongodb = { version = "3.2", optional = true }
 futures = { version = "0.3", optional = true }
 

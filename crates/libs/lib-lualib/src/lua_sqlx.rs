@@ -1,26 +1,29 @@
-use crate::lua_json::{JsonOptions, encode_table};
-use crate::{LOG_LEVEL_ERROR, LOG_LEVEL_INFO, moon_log, moon_send};
+use std::sync::{Arc, atomic::AtomicI64};
+use std::time::Duration;
+
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use lib_core::context::CONTEXT;
-use lib_lua::laux::{LuaArgs, LuaNil, LuaState, LuaTable, LuaValue, lua_into_userdata};
-use lib_lua::luaL_newlib;
-use lib_lua::{self, cstr, ffi, laux, lreg, lreg_null, push_lua_table};
-use sqlx::ColumnIndex;
-use sqlx::ValueRef;
-use sqlx::migrate::MigrateDatabase;
-use sqlx::mysql::MySqlRow;
-use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::sqlite::SqliteRow;
+use sqlx::types::Uuid;
 use sqlx::{
-    Column, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo,
+    Column, ColumnIndex, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite, SqlitePool,
+    TypeInfo, ValueRef,
+    migrate::MigrateDatabase,
+    mysql::MySqlRow,
+    postgres::{PgPoolOptions, PgRow},
+    sqlite::SqliteRow,
+    types::chrono::{NaiveDate, NaiveDateTime, NaiveTime},
+};
+use tokio::{sync::mpsc, time::timeout};
+
+use lib_core::context::CONTEXT;
+use lib_lua::{
+    self, cstr, ffi, laux,
+    laux::{LuaArgs, LuaNil, LuaState, LuaTable, LuaValue, lua_into_userdata},
+    lreg, lreg_null, luaL_newlib, push_lua_table,
 };
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicI64;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time::timeout;
+use crate::lua_json::{JsonOptions, encode_table};
+use crate::{LOG_LEVEL_ERROR, LOG_LEVEL_INFO, moon_log, moon_send};
 
 lazy_static! {
     static ref DATABASE_CONNECTIONSS: DashMap<String, DatabaseConnection> = DashMap::new();
@@ -524,82 +527,156 @@ fn process_rows<'a, DB>(state: LuaState, rows: &'a [<DB as Database>::Row]) -> R
 where
     DB: sqlx::Database,
     usize: ColumnIndex<<DB as Database>::Row>,
-    bool: sqlx::Decode<'a, DB>,
+    i8: sqlx::Decode<'a, DB>,
+    i16: sqlx::Decode<'a, DB>,
+    i32: sqlx::Decode<'a, DB>,
     i64: sqlx::Decode<'a, DB>,
+    f32: sqlx::Decode<'a, DB>,
     f64: sqlx::Decode<'a, DB>,
+    bool: sqlx::Decode<'a, DB>,
     &'a str: sqlx::Decode<'a, DB>,
     &'a [u8]: sqlx::Decode<'a, DB>,
+    NaiveDate: sqlx::Decode<'a, DB>,
+    NaiveDateTime: sqlx::Decode<'a, DB>,
+    NaiveTime: sqlx::Decode<'a, DB>,
+    Uuid: sqlx::Decode<'a, DB>,
 {
     let table = LuaTable::new(state, rows.len(), 0);
     if rows.is_empty() {
         return Ok(1);
     }
 
-    let mut column_info = Vec::new();
-    if column_info.is_empty() {
-        rows.iter()
-            .next()
-            .unwrap()
-            .columns()
-            .iter()
-            .enumerate()
-            .for_each(|(index, column)| {
-                column_info.push((index, column.name()));
-            });
-    }
+    let column_info: Vec<(usize, &str)> = rows
+        .first()
+        .unwrap()
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (index, column.name()))
+        .collect();
 
-    let mut i = 0;
-    for row in rows.iter() {
+    for (i, row) in rows.iter().enumerate() {
         let row_table = LuaTable::new(state, 0, row.len());
         for (index, column_name) in column_info.iter() {
             match row.try_get_raw(*index) {
-                Ok(value) => match value.type_info().name() {
-                    "NULL" => {
+                Ok(value) => {
+                    if value.is_null() {
                         row_table.insert(*column_name, LuaNil {});
+                        continue;
                     }
-                    "BOOL" | "BOOLEAN" => {
-                        row_table.insert(
-                            *column_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(false),
-                        );
+
+                    match value.type_info().name() {
+                        "INT4" | "INT" | "INTEGER" | "MEDIUMINT" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i32);
+                            row_table.insert(*column_name, v);
+                        }
+                        "INT8" | "BIGINT" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i64);
+                            row_table.insert(*column_name, v);
+                        }
+                        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "TINYTEXT"
+                        | "MEDIUMTEXT" | "LONGTEXT" | "NVARCHAR" | "NCHAR" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or("");
+                            row_table.insert(*column_name, v);
+                        }
+                        "FLOAT8" | "DOUBLE" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0.0f64);
+                            row_table.insert(*column_name, v);
+                        }
+                        "FLOAT4" | "FLOAT" | "REAL" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0.0f32);
+                            row_table.insert(*column_name, v);
+                        }
+                        "BOOL" | "BOOLEAN" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(false);
+                            row_table.insert(*column_name, v);
+                        }
+                        "TIMESTAMP" | "TIMESTAMPTZ" | "DATETIME" => {
+                            match <NaiveDateTime as sqlx::decode::Decode<DB>>::decode(value) {
+                                Ok(dt) => {
+                                    row_table.insert(
+                                        *column_name,
+                                        dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+                                    );
+                                }
+                                Err(_) => {
+                                    row_table.insert(*column_name, LuaNil {});
+                                }
+                            }
+                        }
+                        "JSON" | "JSONB" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or("{}");
+                            row_table.insert(*column_name, v);
+                        }
+                        "INT2" | "SMALLINT" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i16);
+                            row_table.insert(*column_name, v);
+                        }
+                        "TINYINT" => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i8);
+                            row_table.insert(*column_name, v);
+                        }
+                        "DATE" => match <NaiveDate as sqlx::decode::Decode<DB>>::decode(value) {
+                            Ok(date) => {
+                                row_table.insert(*column_name, date.format("%Y-%m-%d").to_string());
+                            }
+                            Err(_) => {
+                                row_table.insert(*column_name, LuaNil {});
+                            }
+                        },
+                        "TIME" => match <NaiveTime as sqlx::decode::Decode<DB>>::decode(value) {
+                            Ok(time) => {
+                                row_table.insert(*column_name, time.format("%H:%M:%S").to_string());
+                            }
+                            Err(_) => {
+                                row_table.insert(*column_name, LuaNil {});
+                            }
+                        },
+                        "UUID" => match <Uuid as sqlx::decode::Decode<DB>>::decode(value) {
+                            Ok(uuid) => {
+                                row_table.insert(*column_name, uuid.to_string());
+                            }
+                            Err(_) => {
+                                row_table.insert(*column_name, LuaNil {});
+                            }
+                        },
+                        "BYTEA" | "BLOB" | "VARBINARY" | "BINARY" | "TINYBLOB" | "MEDIUMBLOB"
+                        | "LONGBLOB" => {
+                            let v: &[u8] = sqlx::decode::Decode::decode(value).unwrap_or(b"");
+                            row_table.insert(*column_name, v);
+                        }
+                        "NULL" => {
+                            row_table.insert(*column_name, LuaNil {});
+                        }
+                        "DECIMAL" | "NUMERIC" | "MONEY" => {
+                            return Err(format!(
+                                "Unsupported decimal type for column '{}'",
+                                column_name
+                            ));
+                        }
+                        "TIMETZ" => {
+                            return Err(format!(
+                                "Unsupported time with time zone type for column '{}'",
+                                column_name
+                            ));
+                        }
+                        _ => {
+                            if let Ok(bytes) = sqlx::decode::Decode::decode(value) {
+                                row_table.insert::<&str, &[u8]>(*column_name, bytes);
+                            } else {
+                                row_table.insert(*column_name, LuaNil {});
+                            }
+                        }
                     }
-                    "INT2" | "INT4" | "INT8" | "TINYINT" | "SMALLINT" | "INT" | "MEDIUMINT"
-                    | "BIGINT" | "INTEGER" => {
-                        row_table.insert(
-                            *column_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(0),
-                        );
-                    }
-                    "FLOAT4" | "FLOAT8" | "NUMERIC" | "FLOAT" | "DOUBLE" | "REAL" => {
-                        row_table.insert(
-                            *column_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(0.0),
-                        );
-                    }
-                    "TEXT" => {
-                        row_table.insert(
-                            *column_name,
-                            sqlx::decode::Decode::decode(value).unwrap_or(""),
-                        );
-                    }
-                    _ => {
-                        let column_value: &[u8] =
-                            sqlx::decode::Decode::decode(value).unwrap_or(b"");
-                        row_table.insert(*column_name, column_value);
-                    }
-                },
+                }
                 Err(error) => {
                     laux::lua_push(state, false);
-                    laux::lua_push(
-                        state,
-                        format!("{:?} decode error: {:?}", column_name, error),
-                    );
+                    laux::lua_push(state, format!("{} decode error: {}", column_name, error));
                     return Ok(2);
                 }
             }
         }
-        i += 1;
-        table.rawseti(i);
+        table.rawseti(i + 1);
     }
     Ok(1)
 }
