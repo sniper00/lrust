@@ -5,7 +5,7 @@ moon.loglevel("INFO")
 
 moon.async(function()
     -- 连接MySQL数据库
-    local db = sqlx.connect("mysql://root:qt1HFLrFyPUYFBXddmqm@127.0.0.1:3306/mysql?ssl-mode=DISABLED", "mysql_test")
+    local db = sqlx.connect("mysql://root:123456@127.0.0.1:3306/mysql?ssl-mode=DISABLED", "mysql_test")
     print("MySQL Connection:", db)
     if db.kind then
         print("连接失败:", db.message)
