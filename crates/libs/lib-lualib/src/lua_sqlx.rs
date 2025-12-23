@@ -523,6 +523,63 @@ extern "C-unwind" fn close(state: LuaState) -> i32 {
     }
 }
 
+#[derive(Copy, Clone)]
+enum DbType {
+    Int8,
+    UInt8,
+    Int16,
+    UInt16,
+    Int32,
+    UInt32,
+    Int64,
+    UInt64,
+    Float32,
+    Float64,
+    Text,
+    Bool,
+    Timestamp,
+    Date,
+    Time,
+    Uuid,
+    Bytes,
+    Json,
+    Null,
+    UnsupportedDecimal,
+    UnsupportedTimeWithTz,
+    Unknown,
+}
+
+impl DbType {
+    #[inline]
+    fn from_name(name: &str) -> Self {
+        match name {
+            "INT4" | "INT" | "INTEGER" | "MEDIUMINT" => Self::Int32,
+            "INT8" | "BIGINT" => Self::Int64,
+            "INT2" | "SMALLINT" => Self::Int16,
+            "TINYINT" => Self::Int8,
+            "FLOAT8" | "DOUBLE" => Self::Float64,
+            "FLOAT4" | "FLOAT" | "REAL" => Self::Float32,
+            "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "TINYTEXT" | "MEDIUMTEXT"
+            | "LONGTEXT" | "NVARCHAR" | "NCHAR" => Self::Text,
+            "BOOL" | "BOOLEAN" => Self::Bool,
+            "TIMESTAMP" | "TIMESTAMPTZ" | "DATETIME" => Self::Timestamp,
+            "DATE" => Self::Date,
+            "TIME" => Self::Time,
+            "UUID" => Self::Uuid,
+            "BYTEA" | "BLOB" | "VARBINARY" | "BINARY" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => Self::Bytes,
+            "JSON" | "JSONB" => Self::Json,
+            "NULL" => Self::Null,
+            "DECIMAL" | "NUMERIC" | "MONEY" => Self::UnsupportedDecimal,
+            "TIMETZ" => Self::UnsupportedTimeWithTz,
+            "TINYINT UNSIGNED" => Self::UInt8,
+            "SMALLINT UNSIGNED" => Self::UInt16,
+            "INT UNSIGNED" | "MEDIUMINT UNSIGNED" => Self::UInt32,
+            "BIGINT UNSIGNED" => Self::UInt64,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 fn process_rows<'a, DB>(state: LuaState, rows: &'a [<DB as Database>::Row]) -> Result<i32, String>
 where
     DB: sqlx::Database,
@@ -546,18 +603,22 @@ where
         return Ok(1);
     }
 
-    let column_info: Vec<(usize, &str)> = rows
+    let column_info: Vec<(usize, &str, DbType)> = rows
         .first()
         .unwrap()
         .columns()
         .iter()
         .enumerate()
-        .map(|(index, column)| (index, column.name()))
+        .map(|(index, column)| {
+            let name = column.name();
+            let db_type = DbType::from_name(column.type_info().name());
+            (index, name, db_type)
+        })
         .collect();
 
     for (i, row) in rows.iter().enumerate() {
         let row_table = LuaTable::new(state, 0, row.len());
-        for (index, column_name) in column_info.iter() {
+        for (index, column_name, db_type) in column_info.iter() {
             match row.try_get_raw(*index) {
                 Ok(value) => {
                     if value.is_null() {
@@ -565,33 +626,56 @@ where
                         continue;
                     }
 
-                    match value.type_info().name() {
-                        "INT4" | "INT" | "INTEGER" | "MEDIUMINT" => {
+                    match db_type {
+                        DbType::Int8 => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i8);
+                            row_table.insert(*column_name, v);
+                        }
+                        DbType::UInt8 => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i8) as u8;
+                            row_table.insert(*column_name, v);
+                        }
+                        DbType::Int16 => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i16);
+                            row_table.insert(*column_name, v);
+                        }
+                        DbType::UInt16 => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i16) as u16;
+                            row_table.insert(*column_name, v);
+                        }
+                        DbType::Int32 => {
                             let v = sqlx::decode::Decode::decode(value).unwrap_or(0i32);
                             row_table.insert(*column_name, v);
                         }
-                        "INT8" | "BIGINT" => {
+                        DbType::UInt32 => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i32) as u32;
+                            row_table.insert(*column_name, v);
+                        }
+                        DbType::Int64 => {
                             let v = sqlx::decode::Decode::decode(value).unwrap_or(0i64);
                             row_table.insert(*column_name, v);
                         }
-                        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "TINYTEXT"
-                        | "MEDIUMTEXT" | "LONGTEXT" | "NVARCHAR" | "NCHAR" => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or("");
+                        DbType::UInt64 => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i64) as u64;
                             row_table.insert(*column_name, v);
                         }
-                        "FLOAT8" | "DOUBLE" => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0.0f64);
-                            row_table.insert(*column_name, v);
-                        }
-                        "FLOAT4" | "FLOAT" | "REAL" => {
+                        DbType::Float32 => {
                             let v = sqlx::decode::Decode::decode(value).unwrap_or(0.0f32);
                             row_table.insert(*column_name, v);
                         }
-                        "BOOL" | "BOOLEAN" => {
+                        DbType::Float64 => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0.0f64);
+                            row_table.insert(*column_name, v);
+                        }
+                        DbType::Text => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or("");
+                            row_table.insert(*column_name, v);
+                        }
+                        DbType::Bool => {
                             let v = sqlx::decode::Decode::decode(value).unwrap_or(false);
                             row_table.insert(*column_name, v);
                         }
-                        "TIMESTAMP" | "TIMESTAMPTZ" | "DATETIME" => {
+                        DbType::Timestamp => {
                             match <NaiveDateTime as sqlx::decode::Decode<DB>>::decode(value) {
                                 Ok(dt) => {
                                     row_table.insert(
@@ -604,63 +688,60 @@ where
                                 }
                             }
                         }
-                        "JSON" | "JSONB" => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or("{}");
-                            row_table.insert(*column_name, v);
+                        DbType::Date => {
+                            match <NaiveDate as sqlx::decode::Decode<DB>>::decode(value) {
+                                Ok(date) => {
+                                    row_table.insert(*column_name, date.format("%Y-%m-%d").to_string());
+                                }
+                                Err(_) => {
+                                    row_table.insert(*column_name, LuaNil {});
+                                }
+                            }
                         }
-                        "INT2" | "SMALLINT" => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i16);
-                            row_table.insert(*column_name, v);
+                        DbType::Time => {
+                            match <NaiveTime as sqlx::decode::Decode<DB>>::decode(value) {
+                                Ok(time) => {
+                                    row_table.insert(*column_name, time.format("%H:%M:%S").to_string());
+                                }
+                                Err(_) => {
+                                    row_table.insert(*column_name, LuaNil {});
+                                }
+                            }
                         }
-                        "TINYINT" => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i8);
-                            row_table.insert(*column_name, v);
+                        DbType::Uuid => {
+                            match <Uuid as sqlx::decode::Decode<DB>>::decode(value) {
+                                Ok(uuid) => {
+                                    row_table.insert(*column_name, uuid.to_string());
+                                }
+                                Err(_) => {
+                                    row_table.insert(*column_name, LuaNil {});
+                                }
+                            }
                         }
-                        "DATE" => match <NaiveDate as sqlx::decode::Decode<DB>>::decode(value) {
-                            Ok(date) => {
-                                row_table.insert(*column_name, date.format("%Y-%m-%d").to_string());
-                            }
-                            Err(_) => {
-                                row_table.insert(*column_name, LuaNil {});
-                            }
-                        },
-                        "TIME" => match <NaiveTime as sqlx::decode::Decode<DB>>::decode(value) {
-                            Ok(time) => {
-                                row_table.insert(*column_name, time.format("%H:%M:%S").to_string());
-                            }
-                            Err(_) => {
-                                row_table.insert(*column_name, LuaNil {});
-                            }
-                        },
-                        "UUID" => match <Uuid as sqlx::decode::Decode<DB>>::decode(value) {
-                            Ok(uuid) => {
-                                row_table.insert(*column_name, uuid.to_string());
-                            }
-                            Err(_) => {
-                                row_table.insert(*column_name, LuaNil {});
-                            }
-                        },
-                        "BYTEA" | "BLOB" | "VARBINARY" | "BINARY" | "TINYBLOB" | "MEDIUMBLOB"
-                        | "LONGBLOB" => {
+                        DbType::Bytes => {
                             let v: &[u8] = sqlx::decode::Decode::decode(value).unwrap_or(b"");
                             row_table.insert(*column_name, v);
                         }
-                        "NULL" => {
+                        DbType::Json => {
+                            let v = sqlx::decode::Decode::decode(value).unwrap_or("{}");
+                            row_table.insert(*column_name, v);
+                        }
+                        DbType::Null => {
                             row_table.insert(*column_name, LuaNil {});
                         }
-                        "DECIMAL" | "NUMERIC" | "MONEY" => {
+                        DbType::UnsupportedDecimal => {
                             return Err(format!(
                                 "Unsupported decimal type for column '{}'",
                                 column_name
                             ));
                         }
-                        "TIMETZ" => {
+                        DbType::UnsupportedTimeWithTz => {
                             return Err(format!(
                                 "Unsupported time with time zone type for column '{}'",
                                 column_name
                             ));
                         }
-                        _ => {
+                        DbType::Unknown => {
                             if let Ok(bytes) = sqlx::decode::Decode::decode(value) {
                                 row_table.insert::<&str, &[u8]>(*column_name, bytes);
                             } else {
