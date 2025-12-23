@@ -63,6 +63,10 @@ local res = excel.read("example.xlsx")
 
 ### 3. Sqlx
 
+**IMPORTANT: When shutting down and you need to ensure all data is persisted to the database,
+you must wait until the counter for the specific database connection in M.stats() returns to 0
+before closing that connection or exiting the process**
+
 ```lua
 local moon = require "moon"
 local sqlx = require "ext.sqlx"
@@ -110,7 +114,7 @@ moon.async(function()
     ]]
 
 
-    local db = sqlx.connect("postgres://bruce:123456@localhost/postgres", "test")
+    local db = sqlx.connect("postgres://postgres:123456@localhost/postgres", "test")
     print(db)
     if db.kind then
         print("connect failed", db.message)
@@ -155,10 +159,23 @@ moon.async(function()
     print_r(sqlitedb:query("INSERT INTO test (content) VALUES ('Hello, World!');"))
     print_r(sqlitedb:query("SELECT * FROM test;"))
 
-    print_r(sqlx.stats()) -- Query sqlx left task count
+    while true do
+        local done = true
+        local stats = sqlx.stats()
+        print_r(stats) -- Query sqlx left task count
+        for k,v in pairs(sqlx.stats()) do
+            if v > 0 then
+                done =false
+                break
+            end
+        end
+        if done then
+            break
+        end
+        moon.sleep(100)
+    end
+    moon.quit()
 end)
-
-
 ```
 
 ### 4. MongoDB

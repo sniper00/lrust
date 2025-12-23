@@ -30,6 +30,13 @@ moon.async(function()
             col_int INT,
             col_bigint BIGINT,
             
+            -- 无符号整数类型
+            col_tinyint_unsigned TINYINT UNSIGNED,
+            col_smallint_unsigned SMALLINT UNSIGNED,
+            col_mediumint_unsigned MEDIUMINT UNSIGNED,
+            col_int_unsigned INT UNSIGNED,
+            col_bigint_unsigned BIGINT UNSIGNED,
+            
             -- 浮点类型
             col_float FLOAT,
             col_double DOUBLE,
@@ -70,6 +77,7 @@ moon.async(function()
     res = db:query([[
         INSERT INTO type_test (
             col_tinyint, col_smallint, col_mediumint, col_int, col_bigint,
+            col_tinyint_unsigned, col_smallint_unsigned, col_mediumint_unsigned, col_int_unsigned, col_bigint_unsigned,
             col_float, col_double, col_real,
             col_boolean,
             col_char, col_varchar, col_tinytext, col_text, col_mediumtext, col_longtext,
@@ -78,6 +86,7 @@ moon.async(function()
             col_json
         ) VALUES (
             127, 32767, 8388607, 2147483647, 9223372036854775807,
+            255, 65535, 16777215, 4294967295, 18446744073709551615,
             3.14, 2.718281828, 1.414,
             TRUE,
             'char', 'varchar string', 'tiny text', 'normal text', 'medium text', 'long text',
