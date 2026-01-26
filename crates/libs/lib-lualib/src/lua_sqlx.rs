@@ -549,34 +549,82 @@ enum DbType {
     Unknown,
 }
 
+static DB_TYPE_MAP: phf::Map<&'static str, DbType> = phf::phf_map! {
+    // Int32 types
+    "INT4" => DbType::Int32,
+    "INT" => DbType::Int32,
+    "INTEGER" => DbType::Int32,
+    "MEDIUMINT" => DbType::Int32,
+    // Int64 types
+    "INT8" => DbType::Int64,
+    "BIGINT" => DbType::Int64,
+    // Int16 types
+    "INT2" => DbType::Int16,
+    "SMALLINT" => DbType::Int16,
+    // Int8 type
+    "TINYINT" => DbType::Int8,
+    // Float64 types
+    "FLOAT8" => DbType::Float64,
+    "DOUBLE" => DbType::Float64,
+    // Float32 types
+    "FLOAT4" => DbType::Float32,
+    "FLOAT" => DbType::Float32,
+    "REAL" => DbType::Float32,
+    // Text types
+    "TEXT" => DbType::Text,
+    "VARCHAR" => DbType::Text,
+    "CHAR" => DbType::Text,
+    "BPCHAR" => DbType::Text,
+    "NAME" => DbType::Text,
+    "TINYTEXT" => DbType::Text,
+    "MEDIUMTEXT" => DbType::Text,
+    "LONGTEXT" => DbType::Text,
+    "NVARCHAR" => DbType::Text,
+    "NCHAR" => DbType::Text,
+    // Bool types
+    "BOOL" => DbType::Bool,
+    "BOOLEAN" => DbType::Bool,
+    // Timestamp types
+    "TIMESTAMP" => DbType::Timestamp,
+    "TIMESTAMPTZ" => DbType::Timestamp,
+    "DATETIME" => DbType::Timestamp,
+    // Date type
+    "DATE" => DbType::Date,
+    // Time type
+    "TIME" => DbType::Time,
+    // UUID type
+    "UUID" => DbType::Uuid,
+    // Bytes types
+    "BYTEA" => DbType::Bytes,
+    "BLOB" => DbType::Bytes,
+    "VARBINARY" => DbType::Bytes,
+    "BINARY" => DbType::Bytes,
+    "TINYBLOB" => DbType::Bytes,
+    "MEDIUMBLOB" => DbType::Bytes,
+    "LONGBLOB" => DbType::Bytes,
+    // Json types
+    "JSON" => DbType::Json,
+    "JSONB" => DbType::Json,
+    // Null type
+    "NULL" => DbType::Null,
+    // Unsupported decimal types
+    "DECIMAL" => DbType::UnsupportedDecimal,
+    "NUMERIC" => DbType::UnsupportedDecimal,
+    "MONEY" => DbType::UnsupportedDecimal,
+    // Unsupported time with timezone
+    "TIMETZ" => DbType::UnsupportedTimeWithTz,
+    // Unsigned types
+    "TINYINT UNSIGNED" => DbType::UInt8,
+    "SMALLINT UNSIGNED" => DbType::UInt16,
+    "INT UNSIGNED" => DbType::UInt32,
+    "MEDIUMINT UNSIGNED" => DbType::UInt32,
+    "BIGINT UNSIGNED" => DbType::UInt64,
+};
+
 impl DbType {
     #[inline]
     fn from_name(name: &str) -> Self {
-        match name {
-            "INT4" | "INT" | "INTEGER" | "MEDIUMINT" => Self::Int32,
-            "INT8" | "BIGINT" => Self::Int64,
-            "INT2" | "SMALLINT" => Self::Int16,
-            "TINYINT" => Self::Int8,
-            "FLOAT8" | "DOUBLE" => Self::Float64,
-            "FLOAT4" | "FLOAT" | "REAL" => Self::Float32,
-            "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "TINYTEXT" | "MEDIUMTEXT"
-            | "LONGTEXT" | "NVARCHAR" | "NCHAR" => Self::Text,
-            "BOOL" | "BOOLEAN" => Self::Bool,
-            "TIMESTAMP" | "TIMESTAMPTZ" | "DATETIME" => Self::Timestamp,
-            "DATE" => Self::Date,
-            "TIME" => Self::Time,
-            "UUID" => Self::Uuid,
-            "BYTEA" | "BLOB" | "VARBINARY" | "BINARY" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => Self::Bytes,
-            "JSON" | "JSONB" => Self::Json,
-            "NULL" => Self::Null,
-            "DECIMAL" | "NUMERIC" | "MONEY" => Self::UnsupportedDecimal,
-            "TIMETZ" => Self::UnsupportedTimeWithTz,
-            "TINYINT UNSIGNED" => Self::UInt8,
-            "SMALLINT UNSIGNED" => Self::UInt16,
-            "INT UNSIGNED" | "MEDIUMINT UNSIGNED" => Self::UInt32,
-            "BIGINT UNSIGNED" => Self::UInt64,
-            _ => Self::Unknown,
-        }
+        DB_TYPE_MAP.get(name).copied().unwrap_or(Self::Unknown)
     }
 }
 
