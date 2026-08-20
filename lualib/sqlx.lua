@@ -17,6 +17,23 @@ moon.register_protocol {
 ---@class SqlX
 local M = {}
 
+local pg_array_metatable = {
+    __sqlx_array = true,
+}
+
+--- Create an explicitly typed one-dimensional PostgreSQL array parameter
+---@param element_type string PostgreSQL element type, e.g. "int8", "text", "uuid", or "jsonb"
+---@param values table Array values
+---@return table
+function M.array(element_type, values)
+    assert(type(element_type) == "string", "sqlx.array element_type must be a string")
+    assert(type(values) == "table", "sqlx.array values must be a table")
+    return setmetatable({
+        type = element_type,
+        values = values,
+    }, pg_array_metatable)
+end
+
 --- Connect to a database
 --- Supported database types: MySQL (mysql://), PostgreSQL (postgres://), SQLite (sqlite://)
 --- For SQLite, the database will be automatically created if it doesn't exist
