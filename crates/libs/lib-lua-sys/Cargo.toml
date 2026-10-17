@@ -12,8 +12,8 @@ doctest = false
 libc = "0.2"
 
 [features]
-lua54 = []
-luau = []
+default = ["lua55"]
+lua55 = []
 raw_dylib = []
 
 [build-dependencies]

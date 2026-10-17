@@ -1,4 +1,4 @@
-//! Low level bindings to Lua 5.4/5.3/5.2/5.1 (including LuaJIT) and Roblox Luau.
+//! Lua 5.5 FFI bindings and lifetime-aware Rust callback helpers.
 
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 #![allow(clippy::missing_safety_doc)]
@@ -7,19 +7,12 @@
 
 use std::os::raw::c_int;
 
-#[cfg(any(feature = "lua54", doc))]
-pub use lua54::*;
+#[cfg(any(feature = "lua55", doc))]
+pub use lua55::*;
 
-#[cfg(any(feature = "luau", doc))]
-pub use luau::*;
-
-#[cfg(feature = "lua54")]
+#[cfg(feature = "lua55")]
 #[doc(hidden)]
 pub const LUA_MAX_UPVALUES: c_int = 255;
-
-#[cfg(feature = "luau")]
-#[doc(hidden)]
-pub const LUA_MAX_UPVALUES: c_int = 200;
 
 // I believe `luaL_traceback` < 5.4 requires this much free stack to not error.
 // 5.4 uses `luaL_Buffer`
@@ -65,14 +58,10 @@ pub const SYS_MIN_ALIGN: usize = 4;
 #[macro_use]
 mod macros;
 
-#[cfg(any(feature = "lua54", doc))]
-#[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
-pub mod lua54;
+#[cfg(any(feature = "lua55", doc))]
+#[cfg_attr(docsrs, doc(cfg(feature = "lua55")))]
+pub mod lua55;
 
-pub use lua54 as ffi;
-
-#[cfg(any(feature = "luau", doc))]
-#[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
-pub mod luau;
+pub use lua55 as ffi;
 
 pub mod laux;

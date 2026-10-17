@@ -35,9 +35,9 @@ end
 -- @param name: Connection name
 -- @return connection object or nil
 function M.find_connection(name)
-    local o = {
-        obj = c.find_connection(name)
-    }
+    local obj = c.find_connection(name)
+    if not obj then return nil end
+    local o = {obj=obj}
     return setmetatable(o, { __index = M })
 end
 
@@ -58,7 +58,7 @@ end
 ---@param sql string
 ---@vararg any
 function M:execute(sql, ...)
-    local res = self.obj:query(moon.id, 0, sql, ...)
+    local res = self.obj:execute(moon.id, 0, sql, ...)
     if type(res) == "table" then
         moon.error(print_r(res, true))
     end
@@ -156,10 +156,9 @@ function M.build_connection_string(params)
         error("Password is required")
     end
     
-    if params.encrypt ~= nil then
+    table.insert(parts, "Encrypt=" .. tostring(params.encrypt == true))
+    if params.integrated_security ~= nil then
         table.insert(parts, "IntegratedSecurity=" .. tostring(params.integrated_security))
-    else
-        table.insert(parts, "IntegratedSecurity=false")
     end
     
     if params.trust_server_certificate ~= nil then

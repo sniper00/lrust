@@ -1,295 +1,656 @@
-use std::{
-    sync::atomic::{AtomicI64, Ordering},
-    time::Duration,
-};
+use std::{ffi::c_int, sync::Arc, time::Duration};
 
-use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use dashmap::DashMap;
-use futures::{
-    stream::{SplitSink, SplitStream},
-    SinkExt, TryStreamExt,
-};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use lazy_static::lazy_static;
-use tokio::{net::TcpStream, sync::mpsc, time::timeout};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{Semaphore, mpsc},
+    time::timeout,
+};
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config, connect_async_with_config,
     tungstenite::{
-        http::response,
-        protocol::{frame::coding::CloseCode, CloseFrame},
         Message, Utf8Bytes,
+        handshake::server::{
+            ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
+        },
+        http::{self, response},
+        protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
     },
-    MaybeTlsStream, WebSocketStream,
 };
 
 use lib_core::context::CONTEXT;
 use lib_lua::{
-    self, cstr,
-    ffi::{self},
-    laux::{self, lua_into_userdata, LuaState, LuaTable},
-    lreg, lreg_null, luaL_newlib,
+    cstr, ffi,
+    laux::{self, LuaStack, LuaState, LuaTable},
+    lreg_null, lreg_try, luaL_newlib,
 };
+type ActorId = u32;
 
-use crate::moon_send;
+use crate::LIMITS;
 
 lazy_static! {
-    static ref NET: DashMap<i64, WsChannel> = DashMap::new();
-    static ref NET_UUID: AtomicI64 = AtomicI64::new(1);
+    static ref WS_NET: DashMap<i64, WsChannel> = DashMap::new();
 }
 
 #[derive(Clone)]
 struct WsChannel {
-    pub tx_reader: mpsc::Sender<WsRequest>,
-    pub tx_writer: mpsc::Sender<WsRequest>,
+    tx_reader: mpsc::Sender<WsRequest>,
+    tx_writer: mpsc::Sender<WsRequest>,
 }
 
 #[derive(Debug)]
 enum WsRequest {
-    Read(u32, i64, u64),  // owner, session, read_timeout
-    Write(Message, bool), // owner, session, data, close
+    Read(ActorId, i64, u64),
+    Write(Message, bool),
     Close(Message),
+    Accept(ActorId, i64),
 }
 
 enum WsResponse {
     Connect(i64, response::Response<Option<Vec<u8>>>),
+    Accept(i64, String),
     Read(Message),
-    Error(anyhow::Error),
+    Error(String),
 }
 
-fn next_net_fd() -> i64 {
-    let fd = NET_UUID.fetch_add(1, Ordering::AcqRel);
-    if fd == i64::MAX {
-        panic!("net fd overflow");
-    }
-    fd
+fn next_ws_fd() -> i64 {
+    crate::next_net_fd()
 }
 
-async fn handle_read(
-    protocol_type: u8,
-    owner: u32,
-    session: i64,
+// ---------- Generic connection handler ----------
+
+async fn handle_read<S>(
     read_timeout: u64,
-    reader: &mut SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-) -> Result<()> {
-    if read_timeout > 0 {
-        if let Some(message) =
-            timeout(Duration::from_millis(read_timeout), reader.try_next()).await??
-        {
-            moon_send(protocol_type, owner, session, WsResponse::Read(message));
-            Ok(())
-        } else {
-            Err(anyhow!("eof"))
-        }
-    } else if let Some(message) = reader.try_next().await? {
-        moon_send(protocol_type, owner, session, WsResponse::Read(message));
-        Ok(())
+    reader: &mut futures_util::stream::SplitStream<WebSocketStream<S>>,
+) -> Result<Message, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let result = if read_timeout > 0 {
+        timeout(Duration::from_millis(read_timeout), reader.try_next())
+            .await
+            .map_err(|err| format!("read timeout: {}", err))?
     } else {
-        Err(anyhow!("eof"))
-    }
+        reader.try_next().await
+    };
+    result
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "eof".to_string())
 }
 
-async fn handle_write(
-    mut writer: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+async fn handle_write<S>(
+    writer: &mut futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
     mut rx: mpsc::Receiver<WsRequest>,
-) -> Result<()> {
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     while let Some(op) = rx.recv().await {
         match op {
             WsRequest::Write(data, close) => {
-                writer.send(data).await?;
+                writer.send(data).await.map_err(|e| e.to_string())?;
                 if close {
                     return Ok(());
                 }
             }
             WsRequest::Close(data) => {
-                writer.send(data).await?;
+                writer.send(data).await.map_err(|e| e.to_string())?;
                 return Ok(());
             }
-            _ => {
-                log::error!("write: {:?}", op);
-            }
+            _ => {}
         }
     }
-    Err(anyhow!("writer closed"))
+    Err("writer closed".to_string())
 }
 
-async fn handle_client(
-    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    response: response::Response<Option<Vec<u8>>>,
-    protocol_type: u8,
-    owner: u32,
-    session: i64,
-) {
-    let fd = next_net_fd();
-    let (tx_reader, mut rx_reader) = mpsc::channel::<WsRequest>(1);
+fn setup_ws_connection() -> (i64, mpsc::Receiver<WsRequest>, mpsc::Receiver<WsRequest>) {
+    let fd = next_ws_fd();
+    let (tx_reader, rx_reader) = mpsc::channel::<WsRequest>(1);
     let (tx_writer, rx_writer) = mpsc::channel::<WsRequest>(100);
-    NET.insert(
+    WS_NET.insert(
         fd,
         WsChannel {
             tx_reader,
             tx_writer,
         },
     );
+    (fd, rx_reader, rx_writer)
+}
 
-    moon_send(
-        protocol_type,
-        owner,
-        session,
-        WsResponse::Connect(fd, response),
-    );
+async fn run_connection<S>(
+    stream: WebSocketStream<S>,
+    fd: i64,
+    mut rx_reader: mpsc::Receiver<WsRequest>,
+    rx_writer: mpsc::Receiver<WsRequest>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut writer, mut reader) = stream.split();
+    let mut peer_closed = false;
 
-    let (writer, mut reader) = stream.split();
-
-    let mut read_task = CONTEXT.tokio_runtime.spawn(async move {
-        let mut closed = false;
-        while let Some(op) = rx_reader.recv().await {
+    {
+        let write = handle_write(&mut writer, rx_writer);
+        tokio::pin!(write);
+        loop {
+            let op = tokio::select! {
+                _ = &mut write => break,
+                op = rx_reader.recv() => match op {
+                    Some(op) => op,
+                    None => break,
+                },
+            };
             if let WsRequest::Read(owner, session, read_timeout) = op {
-                if !closed {
-                    if let Err(err) =
-                        handle_read(protocol_type, owner, session, read_timeout, &mut reader).await
-                    {
-                        moon_send(protocol_type, owner, session, WsResponse::Error(err));
-                        closed = true;
+                let result = tokio::select! {
+                    result = &mut write => Err(result.err().unwrap_or_else(|| "closed".to_string())),
+                    result = handle_read(read_timeout, &mut reader) => result,
+                };
+                let closed = match &result {
+                    Ok(message) => {
+                        peer_closed = message.is_close();
+                        peer_closed
                     }
-                } else {
-                    moon_send(
-                        protocol_type,
-                        owner,
-                        session,
-                        WsResponse::Error(anyhow!("closed")),
-                    );
+                    Err(_) => true,
+                };
+                let response = match result {
+                    Ok(message) => WsResponse::Read(message),
+                    Err(err) => WsResponse::Error(err),
+                };
+                let _ = crate::moon_send(25, owner, session, response);
+                if closed {
+                    break;
                 }
             }
         }
-    });
+    }
 
-    let mut write_task = CONTEXT.tokio_runtime.spawn(handle_write(writer, rx_writer));
+    if peer_closed {
+        // Reading Close queues Tungstenite's automatic reply. Flush it before
+        // dropping the socket, with a bound for peers that stop reading.
+        let _ = timeout(Duration::from_secs(1), writer.flush()).await;
+    }
 
-    if tokio::try_join!(&mut read_task, &mut write_task).is_err() {
-        read_task.abort();
-        write_task.abort();
-    };
+    WS_NET.remove(&fd);
+    // Stop accepting reads, then release callers already queued behind the
+    // active read.
+    rx_reader.close();
+    while let Some(op) = rx_reader.recv().await {
+        if let WsRequest::Read(owner, session, _) = op {
+            let _ = crate::moon_send(25, owner, session, WsResponse::Error("closed".to_string()));
+        }
+    }
 }
 
-extern "C-unwind" fn lread(state: LuaState) -> i32 {
-    let conn =
-        laux::lua_touserdata::<WsChannel>(state, 1).expect("Invalid database connect pointer");
-    let owner = laux::lua_get(state, 2);
-    let session = laux::lua_get(state, 3);
-    let timeout = laux::lua_opt(state, 4).unwrap_or(5000);
+// ---------- Client ----------
+
+async fn on_client_connected(
+    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    response: response::Response<Option<Vec<u8>>>,
+    owner: ActorId,
+    session: i64,
+) {
+    let (fd, rx_reader, rx_writer) = setup_ws_connection();
+    let _ = crate::moon_send(25, owner, session, WsResponse::Connect(fd, response));
+    run_connection(stream, fd, rx_reader, rx_writer).await;
+}
+
+// ---------- Server ----------
+
+async fn on_server_accepted(
+    stream: WebSocketStream<TcpStream>,
+    addr: String,
+    owner: ActorId,
+    session: i64,
+) {
+    let (fd, rx_reader, rx_writer) = setup_ws_connection();
+    let _ = crate::moon_send(25, owner, session, WsResponse::Accept(fd, addr));
+    run_connection(stream, fd, rx_reader, rx_writer).await;
+}
+
+// ---------- Connection userdata methods ----------
+
+fn ws_read(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let (owner, session) = crate::take_route(lua, 2)?;
+    let state = lua.state();
+    let conn_ptr = lua
+        .value(1)
+        .as_userdata::<WsChannel>()
+        .ok_or_else(|| "invalid ws connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
+    let read_timeout: u64 = lua.opt(2).unwrap_or(5000);
 
     match conn
         .tx_reader
-        .try_send(WsRequest::Read(owner, session, timeout))
+        .try_send(WsRequest::Read(owner, session, read_timeout))
     {
         Ok(_) => {
             laux::lua_push(state, session);
-            1
+            Ok(1)
         }
         Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("read error: {}", err));
-            2
+            let _ = crate::moon_send(
+                25,
+                owner,
+                session,
+                WsResponse::Error(format!("ws read error: {}", err)),
+            );
+            laux::lua_push(state, session);
+            Ok(1)
         }
     }
 }
 
-extern "C-unwind" fn lwrite(state: LuaState) -> i32 {
-    let conn =
-        laux::lua_touserdata::<WsChannel>(state, 1).expect("Invalid database connect pointer");
+fn to_message(data: impl Into<Bytes>, kind: &str) -> Message {
+    let data = data.into();
+    match kind {
+        "c" => Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: lossy_utf8_bytes(data),
+        })),
+        "t" => Message::Text(lossy_utf8_bytes(data)),
+        "p" => Message::Ping(data),
+        _ => Message::Binary(data),
+    }
+}
 
-    let data: &[u8] = laux::lua_get(state, 2);
-    let c: &str = laux::lua_opt(state, 3).unwrap_or("b");
-    let mut close = false;
+fn lossy_utf8_bytes(data: Bytes) -> Utf8Bytes {
+    // TryFrom checks UTF-8 and keeps the Bytes allocation. The shallow clone
+    // leaves the original available for the existing lossy fallback.
+    match Utf8Bytes::try_from(data.clone()) {
+        Ok(text) => text,
+        Err(_) => String::from_utf8_lossy(&data).into_owned().into(),
+    }
+}
 
-    let m = match c {
-        "c" => {
-            close = true;
-            Message::Close(Some(CloseFrame {
-                code: CloseCode::Normal,
-                reason: unsafe { Utf8Bytes::from_bytes_unchecked(data.into()) },
-            }))
-        }
-        "t" => Message::Text(unsafe { Utf8Bytes::from_bytes_unchecked(data.into()) }),
-        "p" => {
-            close = true;
-            Message::Ping(data.into())
-        }
-        _ => Message::Binary(data.into()),
+fn message_from_buffer(buf: lib_core::buffer::Buffer, kind: &str) -> Message {
+    // Keep the original allocation even when the Buffer has consumed a
+    // prefix. Bytes can expose its unread suffix without moving those bytes.
+    let (data, offset) = buf.into_vec_with_offset();
+    let payload = Bytes::from(data).slice(offset..);
+    to_message(payload, kind)
+}
+
+fn check_message(lua: &mut LuaStack<'_>, index: i32, kind: &str) -> Result<Message, String> {
+    let value = lua.value(index);
+    match value.kind() {
+        laux::LuaType::String => Ok(to_message(
+            value.as_bytes().unwrap_or_default().to_vec(),
+            kind,
+        )),
+        laux::LuaType::UserData => Ok(message_from_buffer(
+            crate::owned_buffer::take(lua, index)?,
+            kind,
+        )),
+        _ => Err(format!(
+            "bad argument #{} (string or Rust buffer userdata expected, got {})",
+            index,
+            value.name()
+        )),
+    }
+}
+
+fn ws_write(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let conn_ptr = lua
+        .value(1)
+        .as_userdata::<WsChannel>()
+        .ok_or_else(|| "invalid ws connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
+    let kind = match lua.value(2).as_str() {
+        Some(kind) => kind,
+        None => return Err("bad argument #2 (valid UTF-8 string expected)".to_string()),
     };
+    let kind = kind.to_owned();
+    let msg = check_message(lua, 3, &kind)?;
+    let close = msg.is_close();
 
-    match conn.tx_writer.try_send(WsRequest::Write(m, close)) {
+    match conn.tx_writer.try_send(WsRequest::Write(msg, close)) {
         Ok(_) => {
             laux::lua_push(state, true);
-            1
+            Ok(1)
         }
-        Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("read error: {}", err));
-            2
-        }
+        Err(err) => Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("ws write error: {}", err),
+        )),
     }
 }
 
-extern "C-unwind" fn lclose(state: LuaState) -> i32 {
-    let conn =
-        laux::lua_touserdata::<WsChannel>(state, 1).expect("Invalid database connect pointer");
-
-    let data: &[u8] = laux::lua_opt(state, 2).unwrap_or_default();
+fn ws_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let conn_ptr = lua
+        .value(1)
+        .as_userdata::<WsChannel>()
+        .ok_or_else(|| "invalid ws connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
+    let data = lua.value(2).as_bytes().unwrap_or_default();
 
     match conn
         .tx_writer
         .try_send(WsRequest::Close(Message::Close(Some(CloseFrame {
             code: CloseCode::Normal,
-            reason: unsafe { Utf8Bytes::from_bytes_unchecked(data.into()) },
+            reason: String::from_utf8_lossy(data).into_owned().into(),
         })))) {
         Ok(_) => {
             laux::lua_push(state, true);
-            1
+            Ok(1)
         }
-        Err(err) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, format!("close error: {}", err));
-            2
-        }
+        Err(err) => Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("ws close error: {}", err),
+        )),
     }
 }
 
-extern "C-unwind" fn lconnect(state: LuaState) -> i32 {
-    let protocol_type: u8 = laux::opt_field(state, 1, "protocol_type").unwrap_or(0);
-    let session = laux::opt_field(state, 1, "session").unwrap_or(0);
-    let owner = laux::opt_field(state, 1, "owner").unwrap_or_default();
-    let url: String = laux::opt_field(state, 1, "url").unwrap_or_default();
-    let connect_timeout = laux::opt_field(state, 1, "connect_timeout").unwrap_or(5000);
+// ---------- Module-level functions ----------
+
+/// Fallback ceiling for the outbound write buffer when `max_message_size` is
+/// uncapped (tungstenite's default incoming message limit is 64 MiB).
+const DEFAULT_WS_MESSAGE_CEILING: usize = 64 << 20;
+
+fn read_ws_config(lua: &mut LuaStack<'_>, index: i32) -> WebSocketConfig {
+    let mut config = WebSocketConfig::default();
+    // Reading fields off a non-table value would make `lua_getfield` raise, so
+    // only consult the options table when one was actually provided. The
+    // write-buffer bounding below still runs so the unbounded tungstenite
+    // default never leaks through, even on the no-options path.
+    let has_opts = lua.value(index).kind() == laux::LuaType::Table;
+    let explicit_max_write_buffer = if has_opts {
+        if let Some(size) = lua.opt_field::<usize>(index, "max_message_size") {
+            config.max_message_size = Some(size);
+        }
+        if let Some(size) = lua.opt_field::<usize>(index, "max_frame_size") {
+            config.max_frame_size = Some(size);
+        }
+        if let Some(size) = lua.opt_field::<usize>(index, "write_buffer_size") {
+            config.write_buffer_size = size;
+        }
+        lua.opt_field::<usize>(index, "max_write_buffer_size")
+    } else {
+        None
+    };
+
+    // tungstenite defaults `max_write_buffer_size` to `usize::MAX`, i.e. the
+    // outbound buffer grows without bound when a peer reads slowly — a
+    // per-connection memory DoS. Bound it by default (still large enough to hold
+    // one max-size message plus the write buffer so normal sends never fail) and
+    // let callers tune it via `max_write_buffer_size`.
+    config.max_write_buffer_size = explicit_max_write_buffer.unwrap_or_else(|| {
+        config
+            .max_message_size
+            .unwrap_or(DEFAULT_WS_MESSAGE_CEILING)
+            .saturating_add(config.write_buffer_size)
+    });
+    // tungstenite requires `max_write_buffer_size > write_buffer_size`.
+    if config.max_write_buffer_size <= config.write_buffer_size {
+        config.max_write_buffer_size = config.write_buffer_size.saturating_add(1);
+    }
+    config
+}
+
+/// Read an optional `origins = { "https://a.com", ... }` allow-list from the
+/// listen options table. When present (non-empty), the server handshake only
+/// upgrades requests whose `Origin` header exactly matches an entry, which
+/// blocks cross-site WebSocket hijacking from browsers. When absent, no Origin
+/// check is performed (suitable for non-browser / trusted clients).
+fn read_allowed_origins(lua: &mut LuaStack<'_>, index: i32) -> Option<Arc<Vec<String>>> {
+    let cursor = lua.table_field_cursor(index, "origins")?;
+    let mut origins = Vec::new();
+    for entry in cursor {
+        let value = entry.value();
+        if let Some(origin) = value.as_str() {
+            origins.push(origin.to_owned());
+        }
+    }
+    if origins.is_empty() {
+        None
+    } else {
+        Some(Arc::new(origins))
+    }
+}
+
+fn ws_connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let (owner, session) = crate::take_route(lua, 1)?;
+    let state = lua.state();
+    laux::lua_checktype(state, 1, ffi::LUA_TTABLE)
+        .map_err(|err| format!("websocket.connect: argument #1 {err}"))?;
+
+    let url: String = lua.opt_field(1, "url").unwrap_or_default();
+    let connect_timeout: u64 = lua.opt_field(1, "connect_timeout").unwrap_or(5000);
+
+    let ws_config = read_ws_config(lua, 1);
 
     CONTEXT.tokio_runtime.spawn(async move {
-        match timeout(Duration::from_millis(connect_timeout), connect_async(url)).await {
-            Ok(Ok(stream)) => {
-                CONTEXT.tokio_runtime.spawn(async move {
-                    handle_client(stream.0, stream.1, protocol_type, owner, session).await;
-                });
+        match timeout(
+            Duration::from_millis(connect_timeout),
+            connect_async_with_config(url, Some(ws_config), false),
+        )
+        .await
+        {
+            Ok(Ok((stream, response))) => {
+                CONTEXT
+                    .tokio_runtime
+                    .spawn(on_client_connected(stream, response, owner, session));
             }
             Ok(Err(err)) => {
-                moon_send(protocol_type, owner, session, WsResponse::Error(err.into()));
+                let _ = crate::moon_send(25, owner, session, WsResponse::Error(err.to_string()));
             }
             Err(err) => {
-                moon_send(protocol_type, owner, session, WsResponse::Error(err.into()));
+                let _ = crate::moon_send(
+                    25,
+                    owner,
+                    session,
+                    WsResponse::Error(format!("connect timeout: {}", err)),
+                );
             }
         }
     });
 
     laux::lua_push(state, session);
-
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
-    let id: i64 = laux::lua_get(state, 1);
-    match NET.get(&id) {
+// The handshake callback's `Err` type (`ErrorResponse`) is fixed by
+// tungstenite's `Callback` trait, so the large-err lint is unavoidable here.
+#[allow(clippy::result_large_err)]
+fn ws_listen(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let _guard = CONTEXT.tokio_runtime.enter();
+
+    let has_opts = laux::lua_type(state, 2) == laux::LuaType::Table;
+    // `read_ws_config` is safe to call even without an options table and always
+    // bounds `max_write_buffer_size`, so don't fall back to the raw default
+    // (which leaves the write buffer unbounded).
+    let ws_config = read_ws_config(lua, 2);
+    let allowed_origins = if has_opts {
+        read_allowed_origins(lua, 2)
+    } else {
+        None
+    };
+    let max_connections: usize = if has_opts {
+        lua.opt_field(2, "max_connections")
+            .unwrap_or(LIMITS.listener_connections)
+    } else {
+        LIMITS.listener_connections
+    };
+
+    let addr = match lua.value(1).as_str() {
+        Some(addr) => addr,
+        None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
+    };
+
+    let listener = match std::net::TcpListener::bind(addr) {
+        Ok(l) => l,
+        Err(err) => {
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("ws listen '{}' failed: {}", addr, err),
+            ));
+        }
+    };
+
+    if let Err(err) = listener.set_nonblocking(true) {
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("ws listen '{}' failed: {}", addr, err),
+        ));
+    }
+
+    let listener = match TcpListener::from_std(listener) {
+        Ok(l) => l,
+        Err(err) => {
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("ws listen '{}' failed: {}", addr, err),
+            ));
+        }
+    };
+
+    let fd = next_ws_fd();
+    let (tx, mut rx) = mpsc::channel::<WsRequest>(1);
+    WS_NET.insert(
+        fd,
+        WsChannel {
+            tx_reader: tx.clone(),
+            tx_writer: tx,
+        },
+    );
+
+    // Bound concurrently live accepted connections; the permit is held for the
+    // whole connection lifetime (moved into the per-connection task).
+    let semaphore = Arc::new(Semaphore::new(max_connections));
+
+    CONTEXT.tokio_runtime.spawn(async move {
+        while let Some(op) = rx.recv().await {
+            match op {
+                WsRequest::Accept(owner, session) => match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        let permit = match semaphore.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                drop(stream);
+                                log::warn!(
+                                    "ws listen fd={}: max connections ({}) reached, rejecting",
+                                    fd,
+                                    max_connections
+                                );
+                                let _ = crate::moon_send(
+                                    25,
+                                    owner,
+                                    session,
+                                    WsResponse::Error(format!(
+                                        "ws max connections ({}) reached",
+                                        max_connections
+                                    )),
+                                );
+                                continue;
+                            }
+                        };
+                        let addr_str = addr.to_string();
+                        let cfg = ws_config;
+                        let origins = allowed_origins.clone();
+                        CONTEXT.tokio_runtime.spawn(async move {
+                            let _permit = permit;
+                            let handshake = accept_hdr_async_with_config(
+                                stream,
+                                |req: &HandshakeRequest,
+                                 resp: HandshakeResponse|
+                                 -> Result<HandshakeResponse, ErrorResponse> {
+                                    if let Some(allowed) = origins.as_deref() {
+                                        let origin = req
+                                            .headers()
+                                            .get("origin")
+                                            .and_then(|v| v.to_str().ok());
+                                        let ok = origin
+                                            .map(|o| allowed.iter().any(|a| a == o))
+                                            .unwrap_or(false);
+                                        if !ok {
+                                            let body = Some(format!(
+                                                "forbidden origin: {}",
+                                                origin.unwrap_or("<missing>")
+                                            ));
+                                            return Err(http::Response::builder()
+                                                .status(http::StatusCode::FORBIDDEN)
+                                                .body(body)
+                                                .expect("static 403 response"));
+                                        }
+                                    }
+                                    Ok(resp)
+                                },
+                                Some(cfg),
+                            )
+                            .await;
+                            match handshake {
+                                Ok(ws_stream) => {
+                                    on_server_accepted(ws_stream, addr_str, owner, session).await;
+                                }
+                                Err(err) => {
+                                    let _ = crate::moon_send(
+                                        25,
+                                        owner,
+                                        session,
+                                        WsResponse::Error(format!("ws handshake failed: {}", err)),
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        let _ = crate::moon_send(
+                            25,
+                            owner,
+                            session,
+                            WsResponse::Error(format!("ws accept failed: {}", err)),
+                        );
+                    }
+                },
+                WsRequest::Close(_) => break,
+                _ => log::warn!("ws listen: unexpected request"),
+            }
+        }
+        WS_NET.remove(&fd);
+    });
+
+    laux::lua_push(state, fd);
+    Ok(1)
+}
+
+fn ws_accept(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let (owner, session) = crate::take_route(lua, 1)?;
+    let state = lua.state();
+    let fd: i64 = lua.get(1)?;
+
+    if let Some(channel) = WS_NET.get(&fd) {
+        if let Err(err) = channel
+            .tx_reader
+            .try_send(WsRequest::Accept(owner, session))
+        {
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("ws accept error: {}", err),
+            ));
+        }
+    } else {
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("ws: fd {} not found", fd),
+        ));
+    }
+    laux::lua_push(state, session);
+    Ok(1)
+}
+
+fn ws_find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let id: i64 = lua.get(1)?;
+    match WS_NET.get(&id) {
         Some(pair) => {
             let l = [
-                lreg!("read", lread),
-                lreg!("write", lwrite),
-                lreg!("close", lclose),
+                lreg_try!("read", ws_read),
+                lreg_try!("write", ws_write),
+                lreg_try!("close", ws_close),
                 lreg_null!(),
             ];
             if laux::lua_newuserdata(
@@ -301,69 +662,284 @@ extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
             .is_none()
             {
                 laux::lua_pushnil(state);
-                return 1;
+                return Ok(1);
             }
         }
         None => {
             laux::lua_pushnil(state);
         }
     }
-    1
+    Ok(1)
 }
 
-fn version_to_string(version: &reqwest::Version) -> &str {
+fn version_to_string(version: &tokio_tungstenite::tungstenite::http::Version) -> &'static str {
     match *version {
-        reqwest::Version::HTTP_09 => "HTTP/0.9",
-        reqwest::Version::HTTP_10 => "HTTP/1.0",
-        reqwest::Version::HTTP_11 => "HTTP/1.1",
-        reqwest::Version::HTTP_2 => "HTTP/2.0",
-        reqwest::Version::HTTP_3 => "HTTP/3.0",
+        tokio_tungstenite::tungstenite::http::Version::HTTP_09 => "HTTP/0.9",
+        tokio_tungstenite::tungstenite::http::Version::HTTP_10 => "HTTP/1.0",
+        tokio_tungstenite::tungstenite::http::Version::HTTP_11 => "HTTP/1.1",
+        tokio_tungstenite::tungstenite::http::Version::HTTP_2 => "HTTP/2.0",
+        tokio_tungstenite::tungstenite::http::Version::HTTP_3 => "HTTP/3.0",
         _ => "Unknown",
     }
 }
 
-extern "C-unwind" fn decode(state: LuaState) -> i32 {
-    laux::lua_checkstack(state, 6, std::ptr::null());
-    let response = lua_into_userdata::<WsResponse>(state, 1);
-    match *response {
-        WsResponse::Connect(id, response) => {
+fn push_ws_response(state: LuaState, response: WsResponse) -> c_int {
+    match response {
+        WsResponse::Connect(fd, resp) => {
             LuaTable::new(state, 0, 6)
-                .insert("fd", id)
-                .insert("version", version_to_string(&response.version()))
-                .insert("status_code", response.status().as_u16())
-                .insert("body", response.body().as_deref().unwrap_or_default())
-                .insert_x("headers", || {
-                    let headers = LuaTable::new(state, 0, response.headers().len());
-                    for (key, value) in response.headers().iter() {
+                .insert("fd", fd)
+                .insert("version", version_to_string(&resp.version()))
+                .insert("status_code", resp.status().as_u16() as i64)
+                .rawset_x("headers", || {
+                    let headers = LuaTable::new(state, 0, resp.headers().len());
+                    for (key, value) in resp.headers().iter() {
                         headers.insert(key.as_str(), value.to_str().unwrap_or("").trim());
                     }
                 });
+
+            if let Some(body) = resp.body() {
+                unsafe {
+                    laux::lua_push(state, body.as_slice());
+                    ffi::lua_setfield(state.as_ptr(), -2, cstr!("body"));
+                }
+            }
+            1
+        }
+        WsResponse::Accept(fd, addr) => {
+            LuaTable::new(state, 0, 2)
+                .insert("fd", fd)
+                .insert("addr", addr.as_str());
             1
         }
         WsResponse::Read(data) => {
-            let is_binary = data.is_binary();
-            laux::lua_push(state, data.into_data().as_ref());
-            laux::lua_push(state, is_binary);
+            let (kind, payload): (&str, &[u8]) = match &data {
+                Message::Text(s) => ("t", s.as_bytes()),
+                Message::Binary(b) => ("b", b.as_ref()),
+                Message::Ping(b) => ("p", b.as_ref()),
+                Message::Pong(b) => ("o", b.as_ref()),
+                Message::Close(frame) => {
+                    if let Some(f) = frame {
+                        ("c", f.reason.as_bytes())
+                    } else {
+                        ("c", &[])
+                    }
+                }
+                Message::Frame(_) => ("f", &[]),
+            };
+            laux::lua_push(state, payload);
+            laux::lua_push(state, kind);
             2
         }
-        WsResponse::Error(error) => {
-            laux::lua_push(state, false);
-            laux::lua_push(state, error.to_string());
-            2
-        }
+        WsResponse::Error(err) => crate::lua_push_error_tuple(state, err.as_str()),
     }
 }
 
-#[cfg(feature = "websocket")]
+fn decode(lua: &mut laux::LuaStack<'_>) -> Result<c_int, String> {
+    let response = unsafe { crate::take_response::<WsResponse>(lua)? };
+    Ok(push_ws_response(lua.state(), *response))
+}
+
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn luaopen_rust_websocket(state: LuaState) -> i32 {
+pub extern "C-unwind" fn luaopen_rust_websocket(state: LuaState) -> c_int {
     let l = [
-        lreg!("connect", lconnect),
-        lreg!("find_connection", find_connection),
-        lreg!("decode", decode),
+        lreg_try!("decode", decode),
+        lreg_try!("connect", ws_connect),
+        lreg_try!("listen", ws_listen),
+        lreg_try!("accept", ws_accept),
+        lreg_try!("find_connection", ws_find_connection),
         lreg_null!(),
     ];
 
     luaL_newlib!(state, l);
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    #[test]
+    fn binary_and_ping_keep_the_unread_buffer_allocation() {
+        for kind in ["b", "p"] {
+            let mut buffer = lib_core::buffer::Buffer::from_slice(b"prefix-payload");
+            buffer.consume(7);
+            let pointer = buffer.data().as_ptr();
+            let message = message_from_buffer(buffer, kind);
+            let payload = match &message {
+                Message::Binary(payload) | Message::Ping(payload) => payload,
+                _ => panic!("unexpected message kind"),
+            };
+            assert_eq!(payload.as_ref(), b"payload");
+            assert_eq!(payload.as_ptr(), pointer);
+        }
+    }
+
+    #[test]
+    fn text_and_close_keep_the_unread_buffer_allocation() {
+        for kind in ["t", "c"] {
+            let mut buffer = lib_core::buffer::Buffer::from_slice(b"prefix-payload");
+            buffer.consume(7);
+            let pointer = buffer.data().as_ptr();
+            let message = message_from_buffer(buffer, kind);
+            let payload = match &message {
+                Message::Text(text) => text.as_bytes(),
+                Message::Close(Some(frame)) => frame.reason.as_bytes(),
+                _ => panic!("unexpected message kind"),
+            };
+            assert_eq!(payload, b"payload");
+            assert_eq!(payload.as_ptr(), pointer);
+        }
+    }
+
+    #[test]
+    fn text_and_close_keep_lossy_utf8_behavior() {
+        let text = b"hello".to_vec();
+        let pointer = text.as_ptr();
+        let message = to_message(text, "t");
+        let Message::Text(payload) = &message else {
+            panic!("expected text message");
+        };
+        assert_eq!(payload.as_bytes().as_ptr(), pointer);
+        assert_eq!(message, Message::Text("hello".into()));
+        assert_eq!(
+            to_message(b"\xff".to_vec(), "t"),
+            Message::Text("\u{fffd}".into())
+        );
+        assert_eq!(
+            to_message(b"\xff".to_vec(), "c"),
+            Message::Close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "\u{fffd}".into(),
+            }))
+        );
+        for kind in ["t", "c"] {
+            let mut buffer = lib_core::buffer::Buffer::from_slice(b"prefix-\xff");
+            buffer.consume(7);
+            assert_eq!(
+                message_from_buffer(buffer, kind),
+                to_message(b"\xff".to_vec(), kind)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_close_is_acknowledged_before_disconnect() {
+        for (local_role, peer_role) in [(Role::Server, Role::Client), (Role::Client, Role::Server)]
+        {
+            let (socket, peer) = tokio::io::duplex(4096);
+            let stream = WebSocketStream::from_raw_socket(socket, local_role, None).await;
+            let mut peer = WebSocketStream::from_raw_socket(peer, peer_role, None).await;
+            let (fd, reads, writes) = setup_ws_connection();
+            WS_NET
+                .get(&fd)
+                .unwrap()
+                .tx_reader
+                .try_send(WsRequest::Read(0, 1, 0))
+                .unwrap();
+            let task = tokio::spawn(run_connection(stream, fd, reads, writes));
+            let frame = Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "done".into(),
+            });
+            peer.send(Message::Close(frame.clone())).await.unwrap();
+            let reply = timeout(Duration::from_secs(2), peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply, Message::Close(frame));
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!WS_NET.contains_key(&fd));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_close_removes_idle_connection() {
+        let (socket, _peer) = tokio::io::duplex(4096);
+        let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+        let (fd, reads, writes) = setup_ws_connection();
+        let channels = WS_NET.get(&fd).unwrap().clone();
+        channels
+            .tx_writer
+            .try_send(WsRequest::Close(Message::Close(None)))
+            .unwrap();
+        timeout(
+            Duration::from_secs(2),
+            run_connection(stream, fd, reads, writes),
+        )
+        .await
+        .unwrap();
+        assert!(!WS_NET.contains_key(&fd));
+        assert!(channels.tx_reader.is_closed());
+        assert!(channels.tx_writer.is_closed());
+    }
+
+    #[tokio::test]
+    async fn connection_shutdown_releases_active_and_queued_readers() {
+        for mode in 0..4 {
+            let owner = 0x7200_0030 + mode;
+            let mut responses = crate::test_host::subscribe(owner);
+            let (socket, peer) = tokio::io::duplex(4096);
+            let stream = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+            let mut peer = WebSocketStream::from_raw_socket(peer, Role::Client, None).await;
+            let (fd, reads, writes) = setup_ws_connection();
+            let channels = WS_NET.get(&fd).unwrap().clone();
+            channels
+                .tx_reader
+                .try_send(WsRequest::Read(owner, 1, if mode == 2 { 100 } else { 0 }))
+                .unwrap();
+            let task = tokio::spawn(run_connection(stream, fd, reads, writes));
+            timeout(Duration::from_secs(2), async {
+                while channels.tx_reader.capacity() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            channels
+                .tx_reader
+                .try_send(WsRequest::Read(owner, 2, 0))
+                .unwrap();
+            match mode {
+                0 => channels
+                    .tx_writer
+                    .try_send(WsRequest::Close(Message::Close(None)))
+                    .unwrap(),
+                1 => {
+                    drop(peer);
+                    channels
+                        .tx_writer
+                        .try_send(WsRequest::Write(Message::Text("test".into()), false))
+                        .unwrap();
+                }
+                2 => {} // Let the active read time out.
+                3 => peer.send(Message::Close(None)).await.unwrap(),
+                _ => unreachable!(),
+            }
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!WS_NET.contains_key(&fd));
+            for session in [1, 2] {
+                let (protocol, reply_session, pointer) = responses
+                    .try_recv()
+                    .expect("waiting reader must be released");
+                assert_eq!(protocol, 25);
+                assert_eq!(reply_session, session);
+                let response = unsafe { *Box::from_raw(pointer as *mut WsResponse) };
+                if mode == 3 && session == 1 {
+                    assert!(matches!(response, WsResponse::Read(Message::Close(_))));
+                } else {
+                    assert!(matches!(response, WsResponse::Error(_)));
+                }
+            }
+            assert!(responses.try_recv().is_err());
+            crate::test_host::unsubscribe(owner);
+        }
+    }
 }

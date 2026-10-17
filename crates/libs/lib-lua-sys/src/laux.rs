@@ -1,6 +1,12 @@
-use crate::{ffi, lua_State, lua_rawlen};
+use crate::{ffi, lua_State};
 use std::{
-    cell::Cell, ffi::{c_char, c_int}, fmt::{Display, Formatter}, marker::PhantomData, ptr::NonNull
+    borrow::Cow,
+    cell::Cell,
+    ffi::{c_char, c_int},
+    fmt::{Display, Formatter},
+    marker::PhantomData,
+    ptr::NonNull,
+    rc::Rc,
 };
 
 pub type LuaState = NonNull<ffi::lua_State>;
@@ -14,240 +20,6 @@ pub struct LuaReg {
 
 pub struct LuaNil;
 
-pub trait LuaStack {
-    fn from_checked(state: LuaState, index: i32) -> Self;
-
-    fn from_unchecked(state: LuaState, index: i32) -> Self;
-
-    fn from_opt(state: LuaState, index: i32) -> Option<Self>
-    where
-        Self: Sized;
-
-    fn push(state: LuaState, v: Self);
-}
-
-macro_rules! impl_lua_stack_integer {
-    ($($t:ty),*) => {
-        $(
-            impl LuaStack for $t {
-                fn from_checked(state: LuaState, index: i32) -> $t {
-                    unsafe { ffi::luaL_checkinteger(state.as_ptr(), index) as $t }
-                }
-
-                fn from_unchecked(state: LuaState, index: i32) -> $t {
-                    unsafe { ffi::lua_tointeger(state.as_ptr(), index) as $t }
-                }
-
-                fn from_opt(state: LuaState, index: i32) -> Option<$t> {
-                    unsafe {
-                        if ffi::lua_isinteger(state.as_ptr(), index) == 0 {
-                            None
-                        } else {
-                            Some(ffi::lua_tointeger(state.as_ptr(), index) as $t)
-                        }
-                    }
-                }
-
-                fn push(state: LuaState, v: $t) {
-                    unsafe {
-                        ffi::lua_pushinteger(state.as_ptr(), v as ffi::lua_Integer);
-                    }
-                }
-            }
-        )*
-    };
-}
-
-impl_lua_stack_integer!(i8, u8, i16, u16, i32, u32, usize, isize, i64, u64);
-
-impl LuaStack for f64 {
-    fn from_checked(state: LuaState, index: i32) -> f64 {
-        unsafe { ffi::luaL_checknumber(state.as_ptr(), index) as f64 }
-    }
-
-    fn from_unchecked(state: LuaState, index: i32) -> f64 {
-        unsafe { ffi::lua_tonumber(state.as_ptr(), index) as f64 }
-    }
-
-    fn from_opt(state: LuaState, index: i32) -> Option<f64> {
-        unsafe {
-            if ffi::lua_isnumber(state.as_ptr(), index) == 0 {
-                None
-            } else {
-                Some(ffi::lua_tonumber(state.as_ptr(), index) as f64)
-            }
-        }
-    }
-
-    fn push(state: LuaState, v: f64) {
-        unsafe {
-            ffi::lua_pushnumber(state.as_ptr(), v as ffi::lua_Number);
-        }
-    }
-}
-
-impl LuaStack for f32 {
-    fn from_checked(state: LuaState, index: i32) -> f32 {
-        unsafe { ffi::luaL_checknumber(state.as_ptr(), index) as f32 }
-    }
-
-    fn from_unchecked(state: LuaState, index: i32) -> f32 {
-        unsafe { ffi::lua_tonumber(state.as_ptr(), index) as f32 }
-    }
-
-    fn from_opt(state: LuaState, index: i32) -> Option<f32> {
-        unsafe {
-            if ffi::lua_isnumber(state.as_ptr(), index) == 0 {
-                None
-            } else {
-                Some(ffi::lua_tonumber(state.as_ptr(), index) as f32)
-            }
-        }
-    }
-
-    fn push(state: LuaState, v: f32) {
-        unsafe {
-            ffi::lua_pushnumber(state.as_ptr(), v as ffi::lua_Number);
-        }
-    }
-}
-
-impl LuaStack for bool {
-    fn from_checked(state: LuaState, index: i32) -> bool {
-        unsafe {
-            ffi::luaL_checktype(state.as_ptr(), index, ffi::LUA_TBOOLEAN);
-            ffi::lua_toboolean(state.as_ptr(), index) != 0
-        }
-    }
-
-    fn from_unchecked(state: LuaState, index: i32) -> bool {
-        unsafe { ffi::lua_toboolean(state.as_ptr(), index) != 0 }
-    }
-
-    fn from_opt(state: LuaState, index: i32) -> Option<bool> {
-        unsafe {
-            if ffi::lua_isnoneornil(state.as_ptr(), index) != 0 {
-                None
-            } else {
-                Some(ffi::lua_toboolean(state.as_ptr(), index) != 0)
-            }
-        }
-    }
-
-    fn push(state: LuaState, v: bool) {
-        unsafe {
-            ffi::lua_pushboolean(state.as_ptr(), v as c_int);
-        }
-    }
-}
-
-impl LuaStack for &[u8] {
-    fn from_checked(state: LuaState, index: i32) -> &'static [u8] {
-        unsafe {
-            let mut len = 0;
-            let ptr = ffi::luaL_checklstring(state.as_ptr(), index, &mut len);
-            std::slice::from_raw_parts(ptr as *const u8, len)
-        }
-    }
-
-    fn from_unchecked(state: LuaState, index: i32) -> &'static [u8] {
-        unsafe {
-            let mut len = 0;
-            let ptr = ffi::lua_tolstring(state.as_ptr(), index, &mut len);
-            std::slice::from_raw_parts(ptr as *const u8, len)
-        }
-    }
-
-    fn from_opt(state: LuaState, index: i32) -> Option<&'static [u8]> {
-        unsafe {
-            if ffi::lua_type(state.as_ptr(), index) != ffi::LUA_TSTRING {
-                None
-            } else {
-                let mut len = 0;
-                let ptr = ffi::lua_tolstring(state.as_ptr(), index, &mut len);
-                if ptr.is_null() {
-                    None
-                } else {
-                    Some(std::slice::from_raw_parts(ptr as *const u8, len))
-                }
-            }
-        }
-    }
-
-    fn push(state: LuaState, v: &[u8]) {
-        unsafe {
-            ffi::lua_pushlstring(state.as_ptr(), v.as_ptr() as *const c_char, v.len());
-        }
-    }
-}
-
-impl LuaStack for &str {
-    fn from_checked(state: LuaState, index: i32) -> &'static str {
-        unsafe { std::str::from_utf8_unchecked(LuaStack::from_checked(state, index)) }
-    }
-
-    fn from_unchecked(state: LuaState, index: i32) -> &'static str {
-        unsafe { std::str::from_utf8_unchecked(LuaStack::from_unchecked(state, index)) }
-    }
-
-    fn from_opt(state: LuaState, index: i32) -> Option<&'static str> {
-        LuaStack::from_opt(state, index).map(|s| unsafe { std::str::from_utf8_unchecked(s) })
-    }
-
-    fn push(state: LuaState, v: &str) {
-        unsafe {
-            ffi::lua_pushlstring(state.as_ptr(), v.as_ptr() as *const c_char, v.len());
-        }
-    }
-}
-
-impl LuaStack for String {
-    fn from_checked(state: LuaState, index: i32) -> String {
-        String::from_utf8_lossy(LuaStack::from_checked(state, index)).into_owned()
-    }
-
-    fn from_unchecked(state: LuaState, index: i32) -> String {
-        String::from_utf8_lossy(LuaStack::from_unchecked(state, index)).into_owned()
-    }
-
-    fn from_opt(state: LuaState, index: i32) -> Option<String> {
-        LuaStack::from_opt(state, index).map(|s| String::from_utf8_lossy(s).into_owned())
-    }
-
-    fn push(state: LuaState, v: String) {
-        unsafe {
-            ffi::lua_pushlstring(state.as_ptr(), v.as_ptr() as *const c_char, v.len());
-        }
-    }
-}
-
-impl LuaStack for LuaNil {
-    fn from_checked(state: LuaState, index: i32) -> LuaNil {
-        unsafe {
-            ffi::luaL_checktype(state.as_ptr(), index, ffi::LUA_TNIL);
-        }
-        LuaNil {}
-    }
-
-    fn from_unchecked(_state: LuaState, _index: i32) -> LuaNil {
-        LuaNil {}
-    }
-
-    fn from_opt(state: LuaState, index: i32) -> Option<LuaNil> {
-        if unsafe { ffi::lua_isnil(state.as_ptr(), index) == 1 } {
-            Some(LuaNil {})
-        } else {
-            None
-        }
-    }
-
-    fn push(state: LuaState, _v: LuaNil) {
-        unsafe {
-            ffi::lua_pushnil(state.as_ptr());
-        }
-    }
-}
-
 #[derive(PartialEq)]
 pub struct LuaThread(pub *mut ffi::lua_State);
 
@@ -260,17 +32,17 @@ impl LuaThread {
 }
 
 #[derive(PartialEq)]
-pub struct LuaStateBox(pub LuaState);
+pub struct LuaGlobalState(pub LuaState);
 
-unsafe impl Send for LuaStateBox {}
+unsafe impl Send for LuaGlobalState {}
 
-impl LuaStateBox {
+impl LuaGlobalState {
     pub fn new(l: LuaState) -> Self {
-        LuaStateBox(l)
+        LuaGlobalState(l)
     }
 }
 
-impl Drop for LuaStateBox {
+impl Drop for LuaGlobalState {
     fn drop(&mut self) {
         unsafe {
             ffi::lua_close(self.0.as_ptr());
@@ -282,86 +54,26 @@ pub extern "C-unwind" fn lua_null_function(_: LuaState) -> i32 {
     0
 }
 
-pub struct LuaScopePop {
-    state: LuaState,
-}
-
-impl LuaScopePop {
-    pub fn new(state: LuaState) -> Self {
-        LuaScopePop { state }
-    }
-}
-
-impl Drop for LuaScopePop {
-    fn drop(&mut self) {
-        unsafe {
-            ffi::lua_pop(self.state.as_ptr(), 1);
-        }
-    }
-}
-
 pub extern "C-unwind" fn lua_traceback(state: LuaState) -> i32 {
     unsafe {
         let msg = ffi::lua_tostring(state.as_ptr(), 1);
         if !msg.is_null() {
             ffi::luaL_traceback(state.as_ptr(), state.as_ptr(), msg, 1);
         } else {
-            ffi::lua_pushliteral(state.as_ptr(), "(no error message)");
+            ffi::lua_pushliteral(state.as_ptr(), c"(no error message)");
         }
         1
     }
 }
 
-pub fn opt_field<T>(state: LuaState, mut index: i32, field: &str) -> Option<T>
-where
-    T: LuaStack,
-{
-    if index < 0 {
-        unsafe {
-            index = ffi::lua_gettop(state.as_ptr()) + index + 1;
-        }
-    }
-
-    let _scope = LuaScopePop::new(state);
-    unsafe {
-        ffi::lua_pushlstring(state.as_ptr(), field.as_ptr() as *const c_char, field.len());
-        if ffi::lua_rawget(state.as_ptr(), index) <= ffi::LUA_TNIL {
-            return None;
-        }
-    }
-
-    LuaStack::from_opt(state, -1)
-}
-
-pub fn lua_get<T>(state: LuaState, index: i32) -> T
-where
-    T: LuaStack,
-{
-    LuaStack::from_checked(state, index)
-}
-
-pub fn lua_to<T>(state: LuaState, index: i32) -> T
-where
-    T: LuaStack,
-{
-    LuaStack::from_unchecked(state, index)
-}
-
-pub fn lua_opt<T>(state: LuaState, index: i32) -> Option<T>
-where
-    T: LuaStack,
-{
-    LuaStack::from_opt(state, index)
-}
-
 pub fn lua_push<T>(state: LuaState, v: T)
 where
-    T: LuaStack,
+    T: LuaPush,
 {
-    LuaStack::push(state, v);
+    LuaPush::push(v, state);
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LuaType {
     None,
     Nil,
@@ -374,24 +86,6 @@ pub enum LuaType {
     UserData,
     Thread,
     Integer,
-}
-
-impl From<LuaType> for i32 {
-    fn from(lua_type: LuaType) -> Self {
-        match lua_type {
-            LuaType::None => ffi::LUA_TNONE,
-            LuaType::Nil => ffi::LUA_TNIL,
-            LuaType::Boolean => ffi::LUA_TBOOLEAN,
-            LuaType::LightUserData => ffi::LUA_TLIGHTUSERDATA,
-            LuaType::Number => ffi::LUA_TNUMBER,
-            LuaType::Integer => ffi::LUA_TNUMBER,
-            LuaType::String => ffi::LUA_TSTRING,
-            LuaType::Table => ffi::LUA_TTABLE,
-            LuaType::Function => ffi::LUA_TFUNCTION,
-            LuaType::UserData => ffi::LUA_TUSERDATA,
-            LuaType::Thread => ffi::LUA_TTHREAD,
-        }
-    }
 }
 
 pub fn lua_type(state: LuaState, index: i32) -> LuaType {
@@ -425,17 +119,15 @@ pub fn lua_error(state: LuaState, message: String) -> ! {
             message.len(),
         );
         drop(message);
+        // Match luaL_error/luaL_argerror: preserve the Lua caller's source
+        // location before raising the Rust-produced error message. Do this
+        // after releasing the Rust string so a location-allocation failure
+        // cannot leak it.
+        ffi::luaL_where(state.as_ptr(), 1);
+        ffi::lua_insert(state.as_ptr(), -2);
+        ffi::lua_concat(state.as_ptr(), 2);
         ffi::lua_error(state.as_ptr())
     }
-}
-
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn lua_arg_error(state: LuaState, index: i32, extra_msg: *const c_char) -> i32 {
-    unsafe { ffi::luaL_argerror(state.as_ptr(), index, extra_msg) }
-}
-
-pub fn throw_error(state: LuaState) -> ! {
-    unsafe { ffi::lua_error(state.as_ptr()) }
 }
 
 pub fn type_name(state: LuaState, t: i32) -> &'static str {
@@ -446,14 +138,18 @@ pub fn type_name(state: LuaState, t: i32) -> &'static str {
     }
 }
 
+/// Format type-mismatch error messages for `from_checked` and similar guards.
+/// `actual` is the raw `ffi::lua_type()` integer — avoids a redundant FFI call
+/// when the caller already has it.
+fn type_mismatch(state: LuaState, actual: i32, expected: &str) -> String {
+    let actual = type_name(state, actual);
+    format!("{expected} expected, got {actual}")
+}
+
 pub fn lua_pushnil(state: LuaState) {
     unsafe {
         ffi::lua_pushnil(state.as_ptr());
     }
-}
-
-pub fn is_integer(state: LuaState, index: i32) -> bool {
-    unsafe { ffi::lua_isinteger(state.as_ptr(), index) != 0 }
 }
 
 pub fn lua_top(state: LuaState) -> i32 {
@@ -472,25 +168,26 @@ pub fn lua_pop(state: LuaState, n: i32) {
     }
 }
 
-pub fn lua_checktype(state: LuaState, index: i32, ltype: i32) {
-    unsafe {
-        ffi::luaL_checktype(state.as_ptr(), index, ltype);
+pub fn lua_checktype(state: LuaState, index: i32, ltype: i32) -> Result<(), String> {
+    let actual = unsafe { ffi::lua_type(state.as_ptr(), index) };
+    if actual == ltype {
+        Ok(())
+    } else {
+        Err(type_mismatch(state, actual, type_name(state, ltype)))
     }
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn lua_checkstack(state: LuaState, sz: i32, msg: *const c_char) {
-    unsafe {
-        ffi::luaL_checkstack(state.as_ptr(), sz, msg);
+pub fn lua_checkstack(state: LuaState, sz: i32, msg: *const c_char) -> Result<(), String> {
+    if unsafe { ffi::lua_checkstack(state.as_ptr(), sz) } != 0 {
+        return Ok(());
     }
-}
 
-///stack +1
-pub fn lua_as_slice(state: LuaState, index: i32) -> &'static [u8] {
-    unsafe {
-        let mut len = 0;
-        let ptr = ffi::luaL_tolstring(state.as_ptr(), index, &mut len);
-        std::slice::from_raw_parts(ptr as *const u8, len)
+    if msg.is_null() {
+        Err("stack overflow".to_string())
+    } else {
+        let msg = unsafe { std::ffi::CStr::from_ptr(msg) }.to_string_lossy();
+        Err(format!("stack overflow ({msg})"))
     }
 }
 
@@ -512,7 +209,7 @@ pub fn lua_newuserdata<T>(
     val: T,
     metaname: *const c_char,
     lib: &[LuaReg],
-) -> Option<&T> {
+) -> Option<NonNull<T>> {
     extern "C-unwind" fn lua_dropuserdata<T>(state: *mut lua_State) -> i32 {
         unsafe {
             let p = ffi::lua_touserdata(state, 1);
@@ -540,42 +237,14 @@ pub fn lua_newuserdata<T>(
         }
 
         ffi::lua_setmetatable(state.as_ptr(), -2);
-        Some(&*ptr.as_ptr())
+        Some(ptr)
     }
-}
-
-pub fn lua_touserdata<T>(state: LuaState, index: i32) -> Option<&'static mut T> {
-    unsafe {
-        let ptr = ffi::lua_touserdata(state.as_ptr(), index);
-        let ptr = std::ptr::NonNull::new(ptr)?;
-        let ptr = ptr.as_ptr() as *mut T;
-        Some(&mut *ptr)
-    }
-}
-
-/// Converts an `isize` value from Lua state at the given index into a Rust `T` object.
-///
-/// # Arguments
-///
-/// * `state` - The Lua state.
-/// * `index` - The index in the Lua stack.
-///
-/// # Safety
-///
-/// This function is unsafe because it dereferences a raw pointer.
-///
-/// # Returns
-///
-/// A `Box<T>` containing the Rust object.
-pub fn lua_into_userdata<T>(state: LuaState, index: i32) -> Box<T> {
-    let p_as_isize: isize = lua_get(state, index);
-    unsafe { Box::from_raw(p_as_isize as *mut T) }
 }
 
 pub struct LuaTable {
     state: LuaState,
     index: i32,
-    pos: Cell<u32>
+    pos: Cell<usize>,
 }
 
 impl LuaTable {
@@ -585,72 +254,53 @@ impl LuaTable {
             LuaTable {
                 state,
                 index: ffi::lua_gettop(state.as_ptr()),
-                pos: Cell::new(0)
+                pos: Cell::new(0),
             }
         }
-    }
-
-    pub fn from_stack(state: LuaState, index: i32) -> Self {
-        LuaTable { state, index: lua_absindex(state, index), pos: Cell::new(0) }
-    }
-
-    pub fn array_from_stack(state: LuaState, index: i32) -> Self {
-        let len = unsafe { ffi::lua_rawlen(state.as_ptr(), index) };
-        LuaTable { state, index: lua_absindex(state, index), pos: Cell::new(len as u32) }
-    }
-
-    pub fn len(&self) -> usize {
-        unsafe { ffi::lua_rawlen(self.state.as_ptr(), self.index) }
-    }
-
-    pub fn array_len(&self) -> (bool, usize) {
-        lua_array_size(self.state, self.index)
-    }
-
-    pub fn lua_state(&self) -> LuaState {
-        self.state
     }
 
     pub fn index(&self) -> i32 {
         self.index
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     pub fn insert<K, V>(&self, key: K, val: V) -> &Self
     where
-        K: LuaStack,
-        V: LuaStack,
+        K: LuaPush,
+        V: LuaPush,
     {
         unsafe {
-            K::push(self.state, key);
-            V::push(self.state, val);
+            K::push(key, self.state);
+            V::push(val, self.state);
             ffi::lua_rawset(self.state.as_ptr(), self.index);
         }
         self
     }
 
-    pub fn push<V>(&self, val: V) -> &Self
+    pub fn push<V>(&self, val: V)
     where
-        V: LuaStack,
+        V: LuaPush,
     {
         unsafe {
-            V::push(self.state, val);
+            V::push(val, self.state);
             self.pos.set(self.pos.get() + 1);
-            ffi::lua_rawseti(self.state.as_ptr(), self.index, self.pos.get() as ffi::lua_Integer);
+            ffi::lua_rawseti(
+                self.state.as_ptr(),
+                self.index,
+                self.pos.get() as ffi::lua_Integer,
+            );
         }
-        self
     }
 
-    pub fn push_table(&self, table: LuaTable) -> &Self
-    {
+    pub fn push_table(&self, table: LuaTable) {
         debug_assert!(table.index == lua_top(self.state));
         unsafe {
-            ffi::lua_rawseti(self.state.as_ptr(), self.index, self.pos.get() as ffi::lua_Integer);
+            self.pos.set(self.pos.get() + 1);
+            ffi::lua_rawseti(
+                self.state.as_ptr(),
+                self.index,
+                self.pos.get() as ffi::lua_Integer,
+            );
         }
-        self
     }
 
     pub fn rawseti(&self, n: usize) {
@@ -660,356 +310,61 @@ impl LuaTable {
     }
 
     /// Pops the value from the top of the stack and sets it in the table at the specified key.
-    pub fn insert_from_stack(&self) -> &Self
-    {
+    pub fn insert_from_stack(&self) {
         unsafe {
             ffi::lua_rawset(self.state.as_ptr(), self.index);
         }
-        self
     }
 
-    pub fn insert_x<K, F>(&self, key: K, f: F) -> &Self
+    pub fn rawset_x<K, F>(&self, key: K, f: F) -> &Self
     where
-        K: LuaStack,
+        K: LuaPush,
         F: FnOnce(),
     {
         unsafe {
-            K::push(self.state, key);
+            K::push(key, self.state);
             f();
             ffi::lua_rawset(self.state.as_ptr(), self.index);
         }
         self
     }
-
-    pub fn rawget<K>(&self, key: K) -> LuaScopeValue<'_>
-    where
-        K: LuaStack,
-    {
-        unsafe {
-            K::push(self.state, key);
-            ffi::lua_rawget(self.state.as_ptr(), self.index);
-            LuaScopeValue {
-                state: self.state,
-                value: LuaValue::from_stack(self.state, -1),
-                _marker: PhantomData,
-            }
-        }
-    }
-
-    #[inline(always)]
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn getmetafield(&self, e: *const c_char) -> Option<LuaScopeValue<'_>> {
-        unsafe {
-            if ffi::luaL_getmetafield(self.state.as_ptr(), self.index, e) == ffi::LUA_TNIL {
-                None
-            } else {
-                Some(LuaScopeValue {
-                    state: self.state,
-                    value: LuaValue::from_stack(self.state, -1),
-                    _marker: PhantomData,
-                })
-            }
-        }
-    }
-
-    pub fn iter(&self) -> LuaTableIterator<'_> {
-        unsafe {
-            ffi::lua_pushnil(self.state.as_ptr());
-        }
-        LuaTableIterator {
-            table: self,
-            has_value: false,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn array_iter(&self) -> LuaArrayIterator<'_> {
-        LuaArrayIterator {
-            table: self,
-            pos: 0,
-            len: self.array_len().1,
-            has_value: false,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn expected_array_iter(&self, len: usize) -> LuaArrayIterator<'_> {
-        LuaArrayIterator {
-            table: self,
-            pos: 0,
-            len,
-            has_value: false,
-            _marker: PhantomData,
-        }
-    }
 }
 
-impl LuaStack for LuaTable {
-    fn from_checked(state: LuaState, index: i32) -> LuaTable {
-        lua_checktype(state, index, ffi::LUA_TTABLE);
-        LuaTable::from_stack(state, index)
-    }
-
-    fn from_unchecked(state: LuaState, index: i32) -> LuaTable {
-        LuaTable::from_stack(state, index)
-    }
-
-    fn from_opt(state: LuaState, index: i32) -> Option<LuaTable> {
-        if lua_type(state, index) != LuaType::Table {
-            return None;
-        }
-        Some(LuaTable::from_stack(state, index))
-    }
-
-    fn push(_: LuaState, _: LuaTable) {
-
-    }
-}
-
-pub struct LuaTableIterator<'a> {
-    table: &'a LuaTable,
-    has_value: bool,
-    _marker: PhantomData<&'a mut LuaTable>,
-}
-
-impl<'a> Iterator for LuaTableIterator<'a> {
-    type Item = (LuaValue<'a>, LuaValue<'a>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        unsafe {
-            if self.has_value {
-                ffi::lua_pop(self.table.state.as_ptr(), 1);
-                self.has_value = false;
-            }
-
-            if ffi::lua_next(self.table.state.as_ptr(), self.table.index) == 0 {
-                return None;
-            }
-
-            self.has_value = true;
-
-            Some((
-                LuaValue::from_stack(self.table.state, -2),
-                LuaValue::from_stack(self.table.state, -1),
-            ))
-        }
-    }
-}
-
-impl Drop for LuaTableIterator<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            if self.has_value {
-                ffi::lua_pop(self.table.state.as_ptr(), 1);
-            }
-        }
-    }
-}
-
-pub struct LuaArrayIterator<'a> {
-    table: &'a LuaTable,
-    pos: usize,
-    len: usize,
-    has_value: bool,
-    _marker: PhantomData<&'a mut LuaTable>,
-}
-
-impl<'a> Iterator for LuaArrayIterator<'a> {
-    type Item = LuaValue<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        unsafe {
-            if self.has_value {
-                self.has_value = false;
-                ffi::lua_pop(self.table.state.as_ptr(), 1);
-            }
-
-            if self.pos >= self.len {
-                return None;
-            }
-
-            self.pos += 1;
-            ffi::lua_rawgeti(
-                self.table.state.as_ptr(),
-                self.table.index,
-                self.pos as ffi::lua_Integer,
-            );
-            self.has_value = true;
-            Some(LuaValue::from_stack(self.table.state, -1))
-        }
-    }
-}
-
-impl Drop for LuaArrayIterator<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            // Clean up any remaining items on stack
-            if self.has_value {
-                ffi::lua_pop(self.table.state.as_ptr(), 1);
-            }
-        }
-    }
-}
-
-pub fn lua_array_size(state: LuaState, idx: i32) -> (bool, usize) {
+fn lua_array_size(state: LuaState, idx: i32) -> usize {
     unsafe {
-        if ffi::luaL_getmetafield(state.as_ptr(), idx, cstr!("__array")) != ffi::LUA_TNIL {
-            ffi::lua_pop(state.as_ptr(), 1);
-            return (true, lua_rawlen(state.as_ptr(), idx));
+        let idx = ffi::lua_absindex(state.as_ptr(), idx);
+        if ffi::lua_type(state.as_ptr(), idx) != ffi::LUA_TTABLE {
+            return 0;
+        }
+        let len = ffi::lua_rawlen(state.as_ptr(), idx);
+        if len == 0 {
+            return 0;
         }
 
-        if ffi::luaL_getmetafield(state.as_ptr(), idx, cstr!("__object")) != ffi::LUA_TNIL {
-            ffi::lua_pop(state.as_ptr(), 1);
-            return (false, 0);
-        }
-
-        let len = lua_rawlen(state.as_ptr(), idx);
-
-        // test first key
-        ffi::lua_pushnil(state.as_ptr());
-        if ffi::lua_next(state.as_ptr(), idx) == 0 { // empty table
-            return (false, 0);
-        }
-
-        let first_key = if ffi::lua_isinteger(state.as_ptr(), -2) != 0 {
-            ffi::lua_tointeger(state.as_ptr(), -2)
-        } else {
-            0
-        };
-
-        ffi::lua_pop(state.as_ptr(), 2);
-
-        if first_key <= 0 {
-            return (false, 0);
-        } else if first_key == 1 {
-            /*
-             * https://www.lua.org/manual/5.4/manual.html#3.4.7
-             * The length operator applied on a table returns a border in that table.
-             * A border in a table t is any natural number that satisfies the following condition :
-             * (border == 0 or t[border] ~= nil) and t[border + 1] == nil
-             */
-            ffi::lua_pushinteger(state.as_ptr(), len as i64);
-            if ffi::lua_next(state.as_ptr(), idx) != 0 {
-                ffi::lua_pop(state.as_ptr(), 2);
-                return (false, 0);
-            }
-        }
-
-        let len = ffi::lua_rawlen(state.as_ptr(), idx) as ffi::lua_Integer;
-        if first_key > len {
-            return (false, 0);
-        }
-
+        // Lua table keys are unique. If every key is an integer in 1..=len and
+        // there are exactly `len` keys, the table is necessarily contiguous and
+        // has neither holes nor a hash part. This validates strict array
+        // semantics in one traversal instead of raw-reading every slot first.
+        let mut count = 0usize;
         ffi::lua_pushnil(state.as_ptr());
         while ffi::lua_next(state.as_ptr(), idx) != 0 {
-            if ffi::lua_isinteger(state.as_ptr(), -2) != 0 {
-                let x = ffi::lua_tointeger(state.as_ptr(), -2);
-                if x > 0 && x <= len {
-                    ffi::lua_pop(state.as_ptr(), 1);
-                    continue;
-                }
-            }
-            ffi::lua_pop(state.as_ptr(), 2);
-            return (false, 0);
-        }
-
-        (true, len as usize)
-    }
-}
-
-pub enum LuaValue<'a> {
-    None,
-    Nil,
-    Boolean(bool),
-    LightUserData(*mut std::ffi::c_void),
-    Number(f64),
-    Integer(i64),
-    String(&'a [u8]),
-    Table(LuaTable),
-    Function(*const std::ffi::c_void),
-    UserData(*mut std::ffi::c_void),
-    Thread(*mut lua_State),
-}
-
-impl LuaValue<'_> {
-    pub fn from_stack(state: LuaState, index: i32) -> Self {
-        match lua_type(state, index) {
-            LuaType::None => LuaValue::None,
-            LuaType::Nil => LuaValue::Nil,
-            LuaType::Boolean => LuaValue::Boolean(lua_to(state, index)),
-            LuaType::LightUserData => {
-                LuaValue::LightUserData(unsafe { ffi::lua_touserdata(state.as_ptr(), index) })
-            }
-            LuaType::Number => LuaValue::Number(lua_to(state, index)),
-            LuaType::Integer => LuaValue::Integer(lua_to(state, index)),
-            LuaType::String => LuaValue::String(lua_to(state, index)),
-            LuaType::Table => LuaValue::Table(LuaTable::from_stack(state, index)),
-            LuaType::Function => {
-                LuaValue::Function(unsafe { ffi::lua_topointer(state.as_ptr(), index) })
-            }
-            LuaType::UserData => {
-                LuaValue::UserData(unsafe { ffi::lua_touserdata(state.as_ptr(), index) })
-            }
-            LuaType::Thread => {
-                LuaValue::Thread(unsafe { ffi::lua_tothread(state.as_ptr(), index) })
+            let valid = ffi::lua_isinteger(state.as_ptr(), -2) != 0 && {
+                let key = ffi::lua_tointeger(state.as_ptr(), -2);
+                key > 0 && (key as usize) <= len
+            };
+            if valid {
+                count += 1;
+                ffi::lua_pop(state.as_ptr(), 1);
+            } else {
+                ffi::lua_pop(state.as_ptr(), 2);
+                return 0;
             }
         }
-    }
 
-    pub fn name(&self) -> String {
-        match self {
-            LuaValue::None => "none".to_string(),
-            LuaValue::Nil => "nil".to_string(),
-            LuaValue::Boolean(_) => "boolean".to_string(),
-            LuaValue::LightUserData(_) => "lightuserdata".to_string(),
-            LuaValue::Number(_) => "number".to_string(),
-            LuaValue::Integer(_) => "number".to_string(),
-            LuaValue::String(_) => "string".to_string(),
-            LuaValue::Table(_) => "table".to_string(),
-            LuaValue::Function(_) => "function".to_string(),
-            LuaValue::UserData(_) => "userdata".to_string(),
-            LuaValue::Thread(_) => "thread".to_string(),
-        }
-    }
-
-    pub fn to_vec(&self) -> Vec<u8> {
-        match self {
-            LuaValue::String(s) => s.to_vec(),
-            LuaValue::Integer(n) => n.to_string().into_bytes(),
-            LuaValue::Number(n) => n.to_string().into_bytes(),
-            _ => Vec::new(),
-        }
-    }
-}
-
-impl Display for LuaValue<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LuaValue::None => write!(f, "none"),
-            LuaValue::Nil => write!(f, "nil"),
-            LuaValue::Boolean(b) => write!(f, "{}", b),
-            LuaValue::LightUserData(p) => write!(f, "{:p}", p),
-            LuaValue::Number(n) => write!(f, "{}", n),
-            LuaValue::Integer(n) => write!(f, "{}", n),
-            LuaValue::String(s) => write!(f, "{}", String::from_utf8_lossy(s)),
-            LuaValue::Table(_) => write!(f, "table"),
-            LuaValue::Function(p) => write!(f, "{:p}", p),
-            LuaValue::UserData(p) => write!(f, "{:p}", p),
-            LuaValue::Thread(p) => write!(f, "{:p}", p),
-        }
-    }
-}
-
-pub struct LuaScopeValue<'a> {
-    state: LuaState,
-    pub value: LuaValue<'a>,
-    _marker: PhantomData<&'a mut LuaTable>,
-}
-
-impl Drop for LuaScopeValue<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            ffi::lua_pop(self.state.as_ptr(), 1);
+        if count == len {
+            len
+        } else {
+            0
         }
     }
 }
@@ -1027,5 +382,1182 @@ impl LuaArgs {
         let result = self.current;
         self.current += 1;
         result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifetime-aware Lua context API
+// ---------------------------------------------------------------------------
+
+/// A borrow-scoped view of one Lua VM. It never owns or closes the VM.
+pub struct LuaStack<'lua> {
+    state: LuaState,
+    _lua: PhantomData<&'lua mut ffi::lua_State>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+/// Creates a context for the duration of a Lua callback.
+pub unsafe fn with_context<R>(
+    state: LuaState,
+    f: impl for<'lua> FnOnce(&'lua mut LuaStack<'lua>) -> R,
+) -> R {
+    let mut context = unsafe { LuaStack::from_raw(state) };
+    f(&mut context)
+}
+
+impl<'lua> LuaStack<'lua> {
+    /// # Safety
+    /// `state` must remain valid for the returned context's lifetime and must
+    /// not be accessed concurrently from another thread.
+    pub unsafe fn from_raw(state: LuaState) -> Self {
+        Self {
+            state,
+            _lua: PhantomData,
+            _not_send: PhantomData,
+        }
+    }
+
+    pub fn state(&self) -> LuaState {
+        self.state
+    }
+    pub fn as_ptr(&self) -> *mut ffi::lua_State {
+        self.state.as_ptr()
+    }
+    pub fn top(&self) -> i32 {
+        unsafe { ffi::lua_gettop(self.as_ptr()) }
+    }
+    pub fn abs_index(&self, index: i32) -> i32 {
+        if index > 0 || index <= ffi::LUA_REGISTRYINDEX {
+            index
+        } else {
+            self.top() + index + 1
+        }
+    }
+
+    pub fn value<'ctx>(&'ctx self, index: i32) -> LuaStackValue<'ctx, 'lua> {
+        let index = self.abs_index(index);
+        LuaStackValue {
+            context: self,
+            index,
+            kind: lua_type(self.state(), index),
+        }
+    }
+
+    /// Returns the raw pointer stored in a full userdata slot without checking
+    /// its Lua type or metatable.
+    ///
+    /// # Safety
+    /// `index` must contain a non-null full userdata whose storage holds a
+    /// valid `T` for every use of the returned pointer. The caller is also
+    /// responsible for preventing aliased mutable access to that `T`.
+    #[inline(always)]
+    pub unsafe fn userdata_ptr_unchecked<T>(&self, index: i32) -> NonNull<T> {
+        unsafe { NonNull::new_unchecked(ffi::lua_touserdata(self.as_ptr(), index).cast::<T>()) }
+    }
+
+    /// Returns the strict contiguous array length for a table at `index`.
+    /// A sparse or mixed-key table returns zero, matching the legacy
+    /// `LuaTable::array_len` behavior.
+    pub fn array_len(&self, index: i32) -> usize {
+        lua_array_size(self.state, index)
+    }
+
+    /// Returns Lua's raw length for a table or string without exposing the
+    /// underlying state handle to callers.
+    pub fn raw_len(&self, index: i32) -> usize {
+        unsafe { ffi::lua_rawlen(self.as_ptr(), index) }
+    }
+
+    /// Borrows bytes from a rooted Lua string while a callback appends values
+    /// above it on the Lua stack.
+    ///
+    /// # Safety
+    /// The source slot must remain rooted and unchanged for the returned
+    /// borrow's lifetime. Callers may only append values above that slot; they
+    /// must not pop, replace, remove, reorder, or otherwise mutate the source
+    /// value, and must not move the borrow across a different Lua state or an
+    /// asynchronous boundary.
+    pub unsafe fn value_bytes_append_only(&self, index: i32) -> Option<&[u8]> {
+        unsafe { self.value(index).as_bytes_append_only() }
+    }
+
+    /// Converts the value at `index` using `T`'s strict [`FromLua`]
+    /// implementation.
+    ///
+    /// Use `get::<Option<T>>` when absence is allowed but a present value must
+    /// still have the expected type.
+    pub fn get<T: FromLua>(&self, index: i32) -> Result<T, LuaTypeError> {
+        T::from_lua(self, index)
+    }
+
+    /// Performs a lenient conversion, returning `None` for a missing value,
+    /// nil, or a type mismatch.
+    ///
+    /// This preserves the legacy `lua_opt` behavior. New APIs should usually
+    /// prefer `get::<Option<T>>` so malformed arguments remain visible.
+    pub fn opt<T: FromLua>(&self, index: i32) -> Option<T> {
+        self.get(index).ok()
+    }
+
+    /// Reads an optional value using Lua's truthiness rules.
+    ///
+    /// Missing and nil values return `None`. Every other Lua value returns
+    /// `Some(lua_toboolean(value))`, so only `false` produces `Some(false)`.
+    /// Use `get::<Option<bool>>` when a present value must be a Lua boolean.
+    pub fn opt_truthy(&self, index: i32) -> Option<bool> {
+        unsafe {
+            if ffi::lua_isnoneornil(self.as_ptr(), index) != 0 {
+                None
+            } else {
+                Some(ffi::lua_toboolean(self.as_ptr(), index) != 0)
+            }
+        }
+    }
+
+    /// Creates a lending cursor over a table's key/value pairs.
+    pub fn table_cursor<'ctx>(&'ctx mut self, index: i32) -> LuaTableCursor<'ctx, 'lua> {
+        LuaTableCursor::new(self, index)
+    }
+
+    /// Opens a table-valued raw field and returns a cursor whose drop restores
+    /// the stack to its pre-field top. This keeps temporary field lookup and
+    /// table iteration in one borrow-scoped operation.
+    pub fn table_field_cursor<'ctx>(
+        &'ctx mut self,
+        index: i32,
+        field: &str,
+    ) -> Option<LuaTableCursor<'ctx, 'lua>> {
+        let top = self.top();
+        let index = self.abs_index(index);
+        if self.value(index).kind() != LuaType::Table {
+            return None;
+        }
+        unsafe {
+            ffi::lua_pushlstring(self.as_ptr(), field.as_ptr() as *const c_char, field.len());
+            ffi::lua_rawget(self.as_ptr(), index);
+        }
+        if self.value(-1).kind() != LuaType::Table {
+            self.set_top(top);
+            return None;
+        }
+        Some(LuaTableCursor::new_with_top(self, -1, top))
+    }
+
+    /// Checks whether a table value has a non-nil metafield without exposing
+    /// the temporary value or changing the caller's stack top.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn has_metafield(&mut self, index: i32, field: *const c_char) -> bool {
+        let top = self.top();
+        let present = unsafe {
+            ffi::luaL_getmetafield(self.as_ptr(), self.abs_index(index), field) != ffi::LUA_TNIL
+        };
+        self.set_top(top);
+        present
+    }
+
+    /// Creates a cursor over the contiguous array part of a table. A non-table,
+    /// sparse, or mixed-key value produces an empty cursor; callers that need
+    /// to distinguish an empty table from an invalid sequence should inspect
+    /// the value type, `array_len`, and the table's keys separately.
+    ///
+    /// # Warning
+    ///
+    /// Values returned by `next()` must be consumed before advancing the
+    /// cursor or mutating the Lua stack.
+    pub fn array_cursor<'ctx>(&'ctx mut self, index: i32) -> LuaArrayCursor<'ctx, 'lua> {
+        let len = self.array_len(index);
+        LuaArrayCursor::new(self, index, len)
+    }
+
+    /// Creates an array cursor with a caller-provided length. This is used by
+    /// encoders that already validated the sequence length and must preserve
+    /// the legacy `expected_array_iter` behavior.
+    pub fn array_cursor_len<'ctx>(
+        &'ctx mut self,
+        index: i32,
+        len: usize,
+    ) -> LuaArrayCursor<'ctx, 'lua> {
+        LuaArrayCursor::new(self, index, len)
+    }
+
+    pub fn push<T: LuaPush>(&mut self, value: T) {
+        value.push(self.state);
+    }
+
+    pub fn opt_field<T: FromLua>(&mut self, index: i32, field: &str) -> Option<T> {
+        let top = self.top();
+        let index = self.abs_index(index);
+        if self.value(index).kind() != LuaType::Table {
+            return None;
+        }
+        unsafe {
+            ffi::lua_pushlstring(self.as_ptr(), field.as_ptr() as *const c_char, field.len());
+            ffi::lua_rawget(self.as_ptr(), index);
+        }
+        let value = if unsafe { ffi::lua_isnil(self.as_ptr(), -1) != 0 } {
+            None
+        } else {
+            T::from_lua(self, -1).ok()
+        };
+        self.set_top(top);
+        value
+    }
+
+    pub fn pop(&mut self, count: i32) {
+        unsafe { ffi::lua_pop(self.as_ptr(), count) }
+    }
+    pub fn set_top(&mut self, top: i32) {
+        unsafe { ffi::lua_settop(self.as_ptr(), top) }
+    }
+}
+
+/// A value borrowed from the Lua stack for the current context borrow.
+#[derive(Clone, Copy)]
+pub struct LuaStackValue<'ctx, 'lua> {
+    context: &'ctx LuaStack<'lua>,
+    index: i32,
+    kind: LuaType,
+}
+
+impl<'ctx, 'lua> LuaStackValue<'ctx, 'lua> {
+    pub fn state(&self) -> LuaState {
+        self.context.state()
+    }
+
+    /// Returns the absolute stack slot represented by this value.
+    ///
+    /// The slot and cached type remain valid only while the surrounding
+    /// cursor/context keeps the value rooted and unchanged; callers must not
+    /// retain it across stack writes or reordering.
+    pub fn index(&self) -> i32 {
+        self.index
+    }
+    pub fn kind(&self) -> LuaType {
+        self.kind
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self.kind() {
+            LuaType::None => "none",
+            LuaType::Nil => "nil",
+            LuaType::Boolean => "boolean",
+            LuaType::LightUserData => "lightuserdata",
+            LuaType::Number | LuaType::Integer => "number",
+            LuaType::String => "string",
+            LuaType::Table => "table",
+            LuaType::Function => "function",
+            LuaType::UserData => "userdata",
+            LuaType::Thread => "thread",
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        (self.kind() == LuaType::Boolean)
+            .then(|| unsafe { ffi::lua_toboolean(self.context.as_ptr(), self.index) != 0 })
+    }
+
+    pub fn as_integer(&self) -> Option<i64> {
+        (self.kind() == LuaType::Integer)
+            .then(|| unsafe { ffi::lua_tointeger(self.context.as_ptr(), self.index) as i64 })
+    }
+
+    pub fn as_number(&self) -> Option<f64> {
+        matches!(self.kind(), LuaType::Number | LuaType::Integer)
+            .then(|| unsafe { ffi::lua_tonumber(self.context.as_ptr(), self.index) as f64 })
+    }
+
+    pub fn as_bytes(&self) -> Option<&'ctx [u8]> {
+        if self.kind() != LuaType::String {
+            return None;
+        }
+        unsafe {
+            let mut len = 0;
+            let ptr = NonNull::new(
+                ffi::lua_tolstring(self.context.as_ptr(), self.index, &mut len) as *mut u8,
+            )?;
+            Some(std::slice::from_raw_parts(ptr.as_ptr(), len))
+        }
+    }
+
+    /// Borrows string bytes while the caller only appends values above this
+    /// stack slot and leaves the slot itself rooted and unchanged.
+    ///
+    /// # Safety
+    /// The stack slot must not be popped, replaced, reordered, or otherwise
+    /// mutated for the returned borrow's lifetime.
+    pub unsafe fn as_bytes_append_only(&self) -> Option<&'ctx [u8]> {
+        self.as_bytes()
+    }
+
+    pub fn as_str(&self) -> Option<&'ctx str> {
+        self.as_bytes()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    }
+
+    /// Returns a string view that borrows valid UTF-8 directly from Lua and
+    /// allocates only when invalid bytes must be replaced.
+    pub fn as_string_lossy(&self) -> Option<Cow<'ctx, str>> {
+        self.as_bytes().map(String::from_utf8_lossy)
+    }
+
+    pub fn as_userdata<T>(&self) -> Option<NonNull<T>> {
+        (self.kind() == LuaType::UserData)
+            .then(|| unsafe {
+                NonNull::new(ffi::lua_touserdata(self.context.as_ptr(), self.index) as *mut T)
+            })
+            .flatten()
+    }
+
+    /// Returns the opaque pointer stored in a lightuserdata value.
+    ///
+    /// `Some(null)` represents a null lightuserdata; `None` means the stack
+    /// value is not lightuserdata. Callers that know the pointee type must make
+    /// that cast explicitly before dereferencing it.
+    pub fn as_light_userdata(&self) -> Option<*mut std::ffi::c_void> {
+        (self.kind() == LuaType::LightUserData)
+            .then(|| unsafe { ffi::lua_touserdata(self.context.as_ptr(), self.index) })
+    }
+}
+
+impl Display for LuaStackValue<'_, '_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.kind() {
+            LuaType::None => f.write_str("none"),
+            LuaType::Nil => f.write_str("nil"),
+            LuaType::Boolean => write!(f, "{}", self.as_bool().unwrap_or(false)),
+            LuaType::LightUserData => {
+                let ptr = unsafe { ffi::lua_touserdata(self.context.as_ptr(), self.index) };
+                write!(f, "{:p}", ptr)
+            }
+            LuaType::Number | LuaType::Integer => {
+                write!(f, "{}", self.as_number().unwrap_or_default())
+            }
+            LuaType::String => {
+                let value = self.as_string_lossy().unwrap_or_default();
+                f.write_str(&value)
+            }
+            LuaType::Table => f.write_str("table"),
+            LuaType::Function => {
+                let ptr = unsafe { ffi::lua_topointer(self.context.as_ptr(), self.index) };
+                write!(f, "{:p}", ptr)
+            }
+            LuaType::UserData => {
+                let ptr = unsafe { ffi::lua_touserdata(self.context.as_ptr(), self.index) };
+                write!(f, "{:p}", ptr)
+            }
+            LuaType::Thread => {
+                let ptr = unsafe { ffi::lua_tothread(self.context.as_ptr(), self.index) };
+                write!(f, "{:p}", ptr)
+            }
+        }
+    }
+}
+
+pub trait LuaPush {
+    fn push(self, state: LuaState);
+}
+
+macro_rules! impl_context_push_integer {
+    ($($type:ty),* $(,)?) => { $(
+        impl LuaPush for $type {
+            fn push(self, state: LuaState) {
+                unsafe { ffi::lua_pushinteger(state.as_ptr(), self as ffi::lua_Integer); }
+            }
+        }
+    )* };
+}
+
+impl_context_push_integer!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
+
+impl LuaPush for f64 {
+    fn push(self, state: LuaState) {
+        unsafe { ffi::lua_pushnumber(state.as_ptr(), self as ffi::lua_Number) }
+    }
+}
+impl LuaPush for bool {
+    fn push(self, state: LuaState) {
+        unsafe { ffi::lua_pushboolean(state.as_ptr(), self as c_int) }
+    }
+}
+impl LuaPush for &str {
+    fn push(self, state: LuaState) {
+        unsafe {
+            ffi::lua_pushlstring(state.as_ptr(), self.as_ptr() as *const c_char, self.len());
+        }
+    }
+}
+impl LuaPush for String {
+    fn push(self, state: LuaState) {
+        self.as_str().push(state);
+    }
+}
+impl LuaPush for &[u8] {
+    fn push(self, state: LuaState) {
+        unsafe {
+            ffi::lua_pushlstring(state.as_ptr(), self.as_ptr() as *const c_char, self.len());
+        }
+    }
+}
+impl LuaPush for Vec<u8> {
+    fn push(self, state: LuaState) {
+        self.as_slice().push(state);
+    }
+}
+impl LuaPush for LuaNil {
+    fn push(self, state: LuaState) {
+        unsafe { ffi::lua_pushnil(state.as_ptr()) }
+    }
+}
+
+/// A lazily inspected key/value frame yielded by [`LuaTableCursor`].
+///
+/// Calling [`key`](Self::key) or [`value`](Self::value) performs the
+/// corresponding Lua type query. An entry and every value borrowed from it
+/// must be consumed before the parent iterator advances.
+pub struct LuaTableEntry<'ctx, 'lua> {
+    lua: NonNull<LuaStack<'lua>>,
+    key_index: i32,
+    value_index: i32,
+    _ctx: PhantomData<&'ctx mut LuaStack<'lua>>,
+}
+
+impl<'lua> LuaTableEntry<'_, 'lua> {
+    #[inline(always)]
+    pub fn key(&self) -> LuaStackValue<'_, 'lua> {
+        let context = unsafe { self.lua.as_ref() };
+        LuaStackValue {
+            context,
+            index: self.key_index,
+            kind: lua_type(context.state(), self.key_index),
+        }
+    }
+
+    #[inline(always)]
+    pub fn value(&self) -> LuaStackValue<'_, 'lua> {
+        let context = unsafe { self.lua.as_ref() };
+        LuaStackValue {
+            context,
+            index: self.value_index,
+            kind: lua_type(context.state(), self.value_index),
+        }
+    }
+
+    /// Directly reborrows the Lua context without stack guards.
+    ///
+    /// # Safety
+    /// No value borrowed from this entry may still be used. The caller must
+    /// preserve the entry's key/value slots and restore the current stack
+    /// height before the iterator advances or is dropped.
+    #[inline(always)]
+    pub unsafe fn lua_mut(&mut self) -> &mut LuaStack<'lua> {
+        debug_assert!(self.key_index > 0 && self.value_index > 0);
+        unsafe { self.lua.as_mut() }
+    }
+}
+
+/// A lending cursor over a Lua table's key/value pairs.
+///
+/// # Warning
+///
+/// A key/value returned by `next()` is valid only until the next cursor
+/// operation or any stack mutation.
+///
+/// # Iterator safety contract
+///
+/// The [`Iterator`] implementation yields a lazy [`LuaTableEntry`] so the
+/// cursor can be used in a `for` loop. The caller must consume every entry and
+/// values borrowed from it within that loop iteration and must not retain or
+/// return them after the iterator is advanced or dropped.
+///
+/// Do not use iterator operations that can retain items, including `collect`,
+/// `peekable`, `zip`, `cycle`, `partition`, `unzip`, or collecting `map`/`filter`
+/// results. Violating this contract can access a Lua stack slot after it has
+/// been replaced or popped. Use the inherent lending [`LuaTableCursor::next`]
+/// method whenever this contract cannot be guaranteed.
+pub struct LuaTableCursor<'ctx, 'lua> {
+    lua: &'ctx mut LuaStack<'lua>,
+    index: i32,
+    restore_top: i32,
+    frame_top: i32,
+    has_value: bool,
+    finished: bool,
+}
+
+impl<'ctx, 'lua> LuaTableCursor<'ctx, 'lua> {
+    fn new(lua: &'ctx mut LuaStack<'lua>, index: i32) -> Self {
+        let frame_top = lua.top();
+        Self::new_with_frame(lua, index, frame_top, frame_top)
+    }
+
+    fn new_with_top(lua: &'ctx mut LuaStack<'lua>, index: i32, restore_top: i32) -> Self {
+        let frame_top = lua.top();
+        Self::new_with_frame(lua, index, restore_top, frame_top)
+    }
+
+    fn new_with_frame(
+        lua: &'ctx mut LuaStack<'lua>,
+        index: i32,
+        restore_top: i32,
+        frame_top: i32,
+    ) -> Self {
+        let index = if index > 0 || index <= ffi::LUA_REGISTRYINDEX {
+            index
+        } else {
+            frame_top + index + 1
+        };
+        let finished = lua.value(index).kind() != LuaType::Table;
+        if !finished {
+            unsafe {
+                ffi::lua_pushnil(lua.as_ptr());
+            }
+        }
+        Self {
+            lua,
+            index,
+            restore_top,
+            frame_top,
+            has_value: false,
+            finished,
+        }
+    }
+
+    #[inline(always)]
+    fn advance(&mut self) -> Option<(i32, i32)> {
+        if self.finished {
+            return None;
+        }
+        unsafe {
+            if self.has_value {
+                ffi::lua_pop(self.lua.as_ptr(), 1);
+                self.has_value = false;
+            }
+            if ffi::lua_next(self.lua.as_ptr(), self.index) == 0 {
+                self.finished = true;
+                return None;
+            }
+            self.has_value = true;
+            let key_index = self.frame_top + 1;
+            let value_index = self.frame_top + 2;
+            Some((key_index, value_index))
+        }
+    }
+
+    pub fn next<'a>(&'a mut self) -> Option<(LuaStackValue<'a, 'lua>, LuaStackValue<'a, 'lua>)> {
+        let (key_index, value_index) = self.advance()?;
+        let context: &'a LuaStack<'lua> = &*self.lua;
+        Some((
+            LuaStackValue {
+                context,
+                index: key_index,
+                kind: lua_type(self.lua.state(), key_index),
+            },
+            LuaStackValue {
+                context,
+                index: value_index,
+                kind: lua_type(self.lua.state(), value_index),
+            },
+        ))
+    }
+
+    /// Directly reborrows the Lua context without stack guards or callbacks.
+    ///
+    /// # Safety
+    /// The caller must preserve the cursor's key/value slots and restore the
+    /// stack to its current height before advancing or dropping the cursor.
+    #[inline(always)]
+    pub unsafe fn lua_mut(&mut self) -> &mut LuaStack<'lua> {
+        debug_assert!(self.has_value && !self.finished);
+        &mut *self.lua
+    }
+}
+impl Drop for LuaTableCursor<'_, '_> {
+    fn drop(&mut self) {
+        let frame_values = if self.finished {
+            0
+        } else if self.has_value {
+            2
+        } else {
+            1
+        };
+        let owned_values = self.frame_top - self.restore_top + frame_values;
+        if owned_values != 0 {
+            unsafe { ffi::lua_pop(self.lua.as_ptr(), owned_values) }
+        }
+    }
+}
+
+/// Enables concise `for` loops over Lua table slots.
+///
+/// This implementation relies on the iterator safety contract documented on
+/// [`LuaTableCursor`]. Standard iterator consumers that retain yielded items
+/// must not be used.
+impl<'ctx, 'lua> Iterator for LuaTableCursor<'ctx, 'lua> {
+    type Item = LuaTableEntry<'ctx, 'lua>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key_index, value_index) = self.advance()?;
+        Some(LuaTableEntry {
+            lua: NonNull::from(&mut *self.lua),
+            key_index,
+            value_index,
+            _ctx: PhantomData,
+        })
+    }
+}
+
+/// A lending cursor over a contiguous Lua table array.
+///
+/// # Warning
+///
+/// A value returned by `next()` is valid only until the next cursor operation
+/// or any stack mutation.
+pub struct LuaArrayCursor<'ctx, 'lua> {
+    lua: &'ctx mut LuaStack<'lua>,
+    index: i32,
+    top: i32,
+    pos: usize,
+    len: usize,
+    has_value: bool,
+}
+
+impl<'ctx, 'lua> LuaArrayCursor<'ctx, 'lua> {
+    fn new(lua: &'ctx mut LuaStack<'lua>, index: i32, len: usize) -> Self {
+        let top = lua.top();
+        let index = if index > 0 || index <= ffi::LUA_REGISTRYINDEX {
+            index
+        } else {
+            top + index + 1
+        };
+        let len = if lua.value(index).kind() == LuaType::Table {
+            len
+        } else {
+            0
+        };
+        Self {
+            lua,
+            index,
+            top,
+            pos: 0,
+            len,
+            has_value: false,
+        }
+    }
+
+    pub fn next<'a>(&'a mut self) -> Option<LuaStackValue<'a, 'lua>> {
+        unsafe {
+            if self.has_value {
+                ffi::lua_pop(self.lua.as_ptr(), 1);
+                self.has_value = false;
+            }
+            if self.pos >= self.len {
+                return None;
+            }
+            self.pos += 1;
+            ffi::lua_rawgeti(self.lua.as_ptr(), self.index, self.pos as ffi::lua_Integer);
+            self.has_value = true;
+            let context: &'a LuaStack<'lua> = &*self.lua;
+            let value_index = self.top + 1;
+            Some(LuaStackValue {
+                context,
+                index: value_index,
+                kind: lua_type(self.lua.state(), value_index),
+            })
+        }
+    }
+
+    pub fn nested_array<'nested>(&'nested mut self, index: i32) -> LuaArrayCursor<'nested, 'lua> {
+        let len = self.lua.array_len(index);
+        LuaArrayCursor::new(&mut *self.lua, index, len)
+    }
+
+    /// Directly reborrows the Lua context without stack guards or callbacks.
+    ///
+    /// # Safety
+    /// The caller must preserve the cursor's value slot and restore the stack
+    /// to its current height before advancing or dropping the cursor.
+    #[inline(always)]
+    pub unsafe fn lua_mut(&mut self) -> &mut LuaStack<'lua> {
+        debug_assert!(self.has_value);
+        &mut *self.lua
+    }
+}
+
+impl Drop for LuaArrayCursor<'_, '_> {
+    fn drop(&mut self) {
+        if self.has_value {
+            unsafe { ffi::lua_pop(self.lua.as_ptr(), 1) }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LuaTypeError {
+    pub expected: &'static str,
+    pub actual: LuaType,
+}
+impl Display for LuaTypeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "expected {}, got {:?}", self.expected, self.actual)
+    }
+}
+impl std::error::Error for LuaTypeError {}
+
+impl From<LuaTypeError> for String {
+    fn from(error: LuaTypeError) -> Self {
+        error.to_string()
+    }
+}
+
+/// Converts a value rooted on a Lua stack into an owned Rust value.
+///
+/// Implementations are strict about the accepted Lua type. In particular,
+/// `String` requires valid UTF-8; use `Vec<u8>` for arbitrary Lua strings.
+pub trait FromLua: Sized {
+    fn from_lua(lua: &LuaStack<'_>, index: i32) -> Result<Self, LuaTypeError>;
+}
+
+impl FromLua for bool {
+    fn from_lua(lua: &LuaStack<'_>, index: i32) -> Result<Self, LuaTypeError> {
+        let value = lua.value(index);
+        value.as_bool().ok_or(LuaTypeError {
+            expected: "boolean",
+            actual: value.kind(),
+        })
+    }
+}
+impl FromLua for f64 {
+    fn from_lua(lua: &LuaStack<'_>, index: i32) -> Result<Self, LuaTypeError> {
+        let mut is_number = 0;
+        let value = unsafe { ffi::lua_tonumberx(lua.as_ptr(), index, &mut is_number) };
+        if is_number != 0 {
+            Ok(value as f64)
+        } else {
+            Err(LuaTypeError {
+                expected: "number",
+                actual: lua_type(lua.state(), index),
+            })
+        }
+    }
+}
+macro_rules! impl_context_from_lua_integer {
+    ($($type:ty),* $(,)?) => { $(
+        impl FromLua for $type {
+            fn from_lua(lua: &LuaStack<'_>, index: i32) -> Result<Self, LuaTypeError> {
+                let mut is_integer = 0;
+                let value = unsafe {
+                    ffi::lua_tointegerx(lua.as_ptr(), index, &mut is_integer)
+                };
+                if is_integer != 0 {
+                    Ok(value as $type)
+                } else {
+                    Err(LuaTypeError {
+                        expected: "integer",
+                        actual: lua_type(lua.state(), index),
+                    })
+                }
+            }
+        }
+    )* };
+}
+impl_context_from_lua_integer!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
+impl FromLua for String {
+    fn from_lua(lua: &LuaStack<'_>, index: i32) -> Result<Self, LuaTypeError> {
+        let value = lua.value(index);
+        value.as_str().map(str::to_owned).ok_or(LuaTypeError {
+            expected: "UTF-8 string",
+            actual: value.kind(),
+        })
+    }
+}
+impl FromLua for Vec<u8> {
+    fn from_lua(lua: &LuaStack<'_>, index: i32) -> Result<Self, LuaTypeError> {
+        let value = lua.value(index);
+        value.as_bytes().map(<[u8]>::to_vec).ok_or(LuaTypeError {
+            expected: "string",
+            actual: value.kind(),
+        })
+    }
+}
+impl FromLua for LuaNil {
+    fn from_lua(lua: &LuaStack<'_>, index: i32) -> Result<Self, LuaTypeError> {
+        let value = lua.value(index);
+        if value.kind() == LuaType::Nil {
+            Ok(LuaNil)
+        } else {
+            Err(LuaTypeError {
+                expected: "nil",
+                actual: value.kind(),
+            })
+        }
+    }
+}
+impl<T: FromLua> FromLua for Option<T> {
+    fn from_lua(lua: &LuaStack<'_>, index: i32) -> Result<Self, LuaTypeError> {
+        if matches!(lua.value(index).kind(), LuaType::None | LuaType::Nil) {
+            Ok(None)
+        } else {
+            T::from_lua(lua, index).map(Some)
+        }
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    fn new_state() -> (LuaState, LuaGlobalState) {
+        let state = NonNull::new(unsafe { ffi::luaL_newstate() }).expect("Lua state allocation");
+        let owner = LuaGlobalState::new(state);
+        (state, owner)
+    }
+
+    fn push_one_entry(state: LuaState) {
+        unsafe {
+            ffi::lua_createtable(state.as_ptr(), 0, 1);
+            ffi::lua_pushliteral(state.as_ptr(), c"key");
+            ffi::lua_pushinteger(state.as_ptr(), 42);
+            ffi::lua_rawset(state.as_ptr(), -3);
+        }
+    }
+
+    fn push_dense_array(state: LuaState) {
+        unsafe {
+            ffi::lua_createtable(state.as_ptr(), 2, 0);
+            ffi::lua_pushinteger(state.as_ptr(), 10);
+            ffi::lua_rawseti(state.as_ptr(), -2, 1);
+            ffi::lua_pushinteger(state.as_ptr(), 20);
+            ffi::lua_rawseti(state.as_ptr(), -2, 2);
+        }
+    }
+
+    #[test]
+    fn type_and_stack_checks_return_errors_without_raising() {
+        let (state, _owner) = new_state();
+        unsafe {
+            ffi::lua_pushinteger(state.as_ptr(), 42);
+            ffi::lua_pushnumber(state.as_ptr(), 42.0);
+            ffi::lua_pushnumber(state.as_ptr(), 42.5);
+        };
+
+        assert!(lua_checktype(state, 1, ffi::LUA_TNUMBER).is_ok());
+        let lua = unsafe { LuaStack::from_raw(state) };
+        assert_eq!(lua.get::<i64>(1).unwrap(), 42);
+        assert_eq!(lua.get::<i64>(2).unwrap(), 42);
+        assert!(lua.get::<i64>(3).is_err());
+        assert!(lua.get::<String>(1).is_err());
+        assert_eq!(
+            lua_checktype(state, 1, ffi::LUA_TTABLE).unwrap_err(),
+            "table expected, got number"
+        );
+        assert!(lua_checkstack(state, 4, std::ptr::null()).is_ok());
+        assert_eq!(
+            lua_checkstack(state, i32::MAX, std::ptr::null()).unwrap_err(),
+            "stack overflow"
+        );
+    }
+
+    #[test]
+    fn lua_type_error_converts_to_string_for_callback_results() {
+        let error = LuaTypeError {
+            expected: "integer",
+            actual: LuaType::String,
+        };
+        assert_eq!(String::from(error), "expected integer, got String");
+    }
+
+    #[test]
+    fn userdata_accessors_keep_full_and_light_userdata_distinct() {
+        let (state, _owner) = new_state();
+        let mut payload = 42i32;
+        let light_ptr = (&mut payload as *mut i32).cast::<std::ffi::c_void>();
+        unsafe {
+            ffi::lua_pushlightuserdata(state.as_ptr(), light_ptr);
+            ffi::lua_newuserdatauv(state.as_ptr(), std::mem::size_of::<i32>(), 0);
+            ffi::lua_pushlightuserdata(state.as_ptr(), std::ptr::null_mut());
+        }
+
+        let lua = unsafe { LuaStack::from_raw(state) };
+        assert!(lua.value(1).as_userdata::<i32>().is_none());
+        assert_eq!(lua.value(1).as_light_userdata(), Some(light_ptr));
+
+        assert!(lua.value(2).as_userdata::<i32>().is_some());
+        assert!(lua.value(2).as_light_userdata().is_none());
+
+        assert_eq!(lua.value(3).as_light_userdata(), Some(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn stack_value_append_only_borrow_reads_rooted_bytes() {
+        let (state, _owner) = new_state();
+        unsafe { ffi::lua_pushliteral(state.as_ptr(), c"rooted bytes") };
+
+        let lua = unsafe { LuaStack::from_raw(state) };
+        let value = lua.value(1);
+        assert_eq!(value.kind(), LuaType::String);
+        assert_eq!(value.as_bytes(), Some(b"rooted bytes".as_slice()));
+        assert!(matches!(
+            value.as_string_lossy(),
+            Some(Cow::Borrowed("rooted bytes"))
+        ));
+        assert_eq!(
+            unsafe { value.as_bytes_append_only() },
+            Some(b"rooted bytes".as_slice())
+        );
+    }
+
+    #[test]
+    fn owned_string_and_bytes_keep_utf8_semantics_distinct() {
+        let (state, _owner) = new_state();
+        let bytes = b"error:\xff";
+        unsafe {
+            ffi::lua_pushlstring(state.as_ptr(), bytes.as_ptr().cast::<c_char>(), bytes.len());
+            ffi::lua_pushnil(state.as_ptr());
+        }
+
+        let lua = unsafe { LuaStack::from_raw(state) };
+        assert_eq!(lua.get::<Vec<u8>>(1).unwrap(), bytes);
+        assert!(lua.get::<String>(1).is_err());
+        assert!(matches!(
+            lua.value(1).as_string_lossy(),
+            Some(Cow::Owned(_))
+        ));
+        assert_eq!(
+            lua.value(1).as_string_lossy().as_deref(),
+            Some(String::from_utf8_lossy(bytes).as_ref())
+        );
+        assert_eq!(lua.get::<Option<Vec<u8>>>(2).unwrap(), None);
+        assert_eq!(lua.opt::<Vec<u8>>(1), Some(bytes.to_vec()));
+        assert!(lua.get::<LuaNil>(1).is_err());
+        assert!(lua.get::<LuaNil>(2).is_ok());
+    }
+
+    #[test]
+    fn optional_truthy_preserves_lua_boolean_conversion() {
+        let (state, _owner) = new_state();
+        unsafe {
+            ffi::lua_pushnil(state.as_ptr());
+            ffi::lua_pushboolean(state.as_ptr(), 0);
+            ffi::lua_pushboolean(state.as_ptr(), 1);
+            ffi::lua_pushinteger(state.as_ptr(), 0);
+            ffi::lua_pushliteral(state.as_ptr(), c"");
+            ffi::lua_createtable(state.as_ptr(), 0, 0);
+        }
+
+        let lua = unsafe { LuaStack::from_raw(state) };
+        assert_eq!(lua.opt_truthy(99), None);
+        assert_eq!(lua.opt_truthy(1), None);
+        assert_eq!(lua.opt_truthy(2), Some(false));
+        assert_eq!(lua.opt_truthy(3), Some(true));
+        assert_eq!(lua.opt_truthy(4), Some(true));
+        assert_eq!(lua.opt_truthy(5), Some(true));
+        assert_eq!(lua.opt_truthy(6), Some(true));
+
+        assert_eq!(lua.get::<Option<bool>>(1).unwrap(), None);
+        assert_eq!(lua.get::<Option<bool>>(2).unwrap(), Some(false));
+        assert!(lua.get::<Option<bool>>(4).is_err());
+    }
+
+    #[test]
+    fn strict_array_len_handles_dense_sparse_mixed_and_non_table_values() {
+        let (state, _owner) = new_state();
+        unsafe {
+            push_dense_array(state); // 1: dense
+
+            ffi::lua_createtable(state.as_ptr(), 1, 1); // 2: sparse
+            ffi::lua_pushinteger(state.as_ptr(), 10);
+            ffi::lua_rawseti(state.as_ptr(), -2, 1);
+            ffi::lua_pushinteger(state.as_ptr(), 30);
+            ffi::lua_rawseti(state.as_ptr(), -2, 3);
+
+            ffi::lua_createtable(state.as_ptr(), 1, 1); // 3: mixed
+            ffi::lua_pushinteger(state.as_ptr(), 10);
+            ffi::lua_rawseti(state.as_ptr(), -2, 1);
+            ffi::lua_pushliteral(state.as_ptr(), c"key");
+            ffi::lua_pushinteger(state.as_ptr(), 20);
+            ffi::lua_rawset(state.as_ptr(), -3);
+
+            ffi::lua_createtable(state.as_ptr(), 0, 0); // 4: empty
+            ffi::lua_pushliteral(state.as_ptr(), c"not a table"); // 5
+        }
+
+        let lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+        assert_eq!(lua.array_len(1), 2);
+        assert_eq!(lua.array_len(2), 0);
+        assert_eq!(lua.array_len(3), 0);
+        assert_eq!(lua.array_len(4), 0);
+        assert_eq!(lua.array_len(5), 0);
+        assert_eq!(lua.top(), top);
+    }
+
+    #[test]
+    fn field_accessors_and_cursor_restore_every_temporary_value() {
+        let (state, _owner) = new_state();
+        unsafe {
+            ffi::lua_createtable(state.as_ptr(), 0, 2);
+
+            ffi::lua_pushliteral(state.as_ptr(), c"name");
+            ffi::lua_pushliteral(state.as_ptr(), c"moon");
+            ffi::lua_rawset(state.as_ptr(), -3);
+
+            ffi::lua_pushliteral(state.as_ptr(), c"headers");
+            ffi::lua_createtable(state.as_ptr(), 0, 1);
+            ffi::lua_pushliteral(state.as_ptr(), c"x-test");
+            ffi::lua_pushinteger(state.as_ptr(), 42);
+            ffi::lua_rawset(state.as_ptr(), -3);
+            ffi::lua_rawset(state.as_ptr(), -3);
+
+            ffi::lua_pushinteger(state.as_ptr(), 7);
+        }
+
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+        assert_eq!(lua.opt_field::<String>(1, "name").as_deref(), Some("moon"));
+        assert_eq!(lua.opt_field::<String>(1, "missing"), None);
+        assert_eq!(lua.opt_field::<String>(2, "name"), None);
+        assert_eq!(lua.top(), top);
+
+        {
+            let mut cursor = lua
+                .table_field_cursor(1, "headers")
+                .expect("table-valued field");
+            let (key, value) = cursor.next().expect("one header");
+            assert_eq!(key.as_str(), Some("x-test"));
+            assert_eq!(value.as_integer(), Some(42));
+        }
+        assert_eq!(lua.top(), top);
+        assert!(lua.table_field_cursor(1, "name").is_none());
+        assert!(lua.table_field_cursor(2, "headers").is_none());
+        assert_eq!(lua.top(), top);
+    }
+
+    #[test]
+    fn cursors_over_non_tables_are_empty_and_leave_the_stack_unchanged() {
+        let (state, _owner) = new_state();
+        unsafe { ffi::lua_pushliteral(state.as_ptr(), c"not a table") };
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+
+        {
+            let mut cursor = lua.table_cursor(1);
+            assert!(cursor.next().is_none());
+            assert!(cursor.next().is_none());
+        }
+        {
+            let mut cursor = lua.array_cursor_len(1, 3);
+            assert!(cursor.next().is_none());
+            assert!(cursor.next().is_none());
+        }
+        assert_eq!(lua.top(), top);
+    }
+
+    #[test]
+    fn cursor_lua_mut_allows_stack_neutral_ffi_work() {
+        let (state, _owner) = new_state();
+        push_one_entry(state);
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+        {
+            let mut cursor = lua.table_cursor(1);
+            assert!(cursor.next().is_some());
+            let frame_top = unsafe { ffi::lua_gettop(state.as_ptr()) };
+            unsafe {
+                let lua = cursor.lua_mut();
+                lua.push(99);
+                lua.pop(1);
+            }
+            assert_eq!(unsafe { ffi::lua_gettop(state.as_ptr()) }, frame_top);
+            assert!(cursor.next().is_none());
+        }
+        assert_eq!(lua.top(), top);
+    }
+
+    #[test]
+    fn partially_consumed_cursors_restore_the_stack() {
+        let (state, _owner) = new_state();
+        push_dense_array(state);
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+
+        {
+            let mut cursor = lua.array_cursor(1);
+            assert_eq!(cursor.next().and_then(|value| value.as_integer()), Some(10));
+        }
+        assert_eq!(lua.top(), top);
+
+        {
+            let mut cursor = lua.table_cursor(1);
+            assert!(cursor.next().is_some());
+        }
+        assert_eq!(lua.top(), top);
+    }
+
+    #[test]
+    fn table_cursor_is_fused_and_restores_stack() {
+        let (state, _owner) = new_state();
+        push_one_entry(state);
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+        {
+            let mut cursor = lua.table_cursor(-1);
+            let (key, value) = cursor.next().expect("one table entry");
+            assert_eq!(key.as_str(), Some("key"));
+            assert_eq!(value.as_integer(), Some(42));
+            assert!(cursor.next().is_none());
+            assert!(cursor.next().is_none());
+        }
+        assert_eq!(lua.top(), top);
+    }
+
+    #[test]
+    fn table_cursor_supports_non_retaining_for_loops() {
+        let (state, _owner) = new_state();
+        push_one_entry(state);
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+        let mut seen = 0;
+
+        for entry in lua.table_cursor(1) {
+            let key = entry.key();
+            let value = entry.value();
+            assert_eq!(key.as_str(), Some("key"));
+            assert_eq!(value.as_integer(), Some(42));
+            seen += 1;
+        }
+
+        assert_eq!(seen, 1);
+        assert_eq!(lua.top(), top);
+    }
+
+    #[test]
+    fn array_cursor_supports_nested_tables_and_restores_stack() {
+        let (state, _owner) = new_state();
+        unsafe {
+            ffi::lua_createtable(state.as_ptr(), 1, 0); // outer
+            ffi::lua_createtable(state.as_ptr(), 1, 0); // inner
+            ffi::lua_pushinteger(state.as_ptr(), 7);
+            ffi::lua_rawseti(state.as_ptr(), -2, 1);
+            ffi::lua_rawseti(state.as_ptr(), -2, 1);
+        }
+
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+        {
+            let mut outer = lua.array_cursor(-1);
+            let inner_index = {
+                let inner = outer.next().expect("outer array entry");
+                assert_eq!(inner.kind(), LuaType::Table);
+                inner.index()
+            };
+            {
+                let mut inner = outer.nested_array(inner_index);
+                assert_eq!(inner.next().and_then(|v| v.as_integer()), Some(7));
+                assert!(inner.next().is_none());
+            }
+            assert!(outer.next().is_none());
+            assert!(outer.next().is_none());
+        }
+        assert_eq!(lua.top(), top);
     }
 }

@@ -1,3 +1,8 @@
+//! A growable, seekable byte buffer shared across moon_rs crates.
+//!
+//! Dependency-free (std only) so it can be linked into the main runtime as well
+//! as standalone Lua C extension cdylibs without pulling in any extra crates.
+
 use std::fmt;
 
 #[allow(dead_code)]
@@ -8,6 +13,7 @@ pub struct Buffer {
 }
 
 pub const DEFAULT_RESERVE: usize = 128;
+pub const BUFFER_HEAD_RESERVE: usize = 16;
 
 #[allow(dead_code)]
 impl Buffer {
@@ -41,6 +47,7 @@ impl Buffer {
     }
 
     pub fn unsafe_write(&mut self, c: u8) {
+        debug_assert!(self.data.len() < self.data.capacity());
         unsafe {
             let len = self.data.len() + 1;
             self.data.set_len(len);
@@ -48,6 +55,7 @@ impl Buffer {
         }
     }
 
+    #[must_use]
     pub fn write_front(&mut self, data: &[u8]) -> bool {
         let len: usize = data.len();
         if len > self.rpos {
@@ -136,7 +144,17 @@ impl Buffer {
         self.data.len() == self.rpos
     }
 
-    pub fn prepare(&mut self, size: usize) -> &mut [u8] {
+    /// Reserve `size` bytes of contiguous spare capacity at the tail (compacting
+    /// already-consumed front bytes and growing as needed) and return a raw
+    /// pointer to the start of that region.
+    ///
+    /// The region is **uninitialized**: the caller must write the bytes it needs
+    /// and then call [`commit`](Self::commit) to extend the logical length. A raw
+    /// pointer (rather than `&mut [u8]`) is returned on purpose — forming a slice
+    /// reference over uninitialized memory is a soundness gray area, so the caller
+    /// builds a slice only at the point where it initializes the bytes (e.g.
+    /// immediately before `read_exact`/`copy_from_slice`).
+    pub fn prepare(&mut self, size: usize) -> *mut u8 {
         let tail_free_space = self.data.capacity() - self.data.len();
         if tail_free_space < size {
             let count = self.data.len() - self.rpos;
@@ -150,23 +168,22 @@ impl Buffer {
                     self.data.set_len(self.rpos + count);
                 }
             } else {
-                let required_size = self.data.len() + size;
-                let mut new_vec = Vec::<u8>::with_capacity(required_size);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        self.data.as_ptr(),
-                        new_vec.as_mut_ptr(),
-                        self.data.len(),
-                    );
-                    new_vec.set_len(self.data.len());
-                    self.data = new_vec;
+                if self.rpos != 0 {
+                    unsafe {
+                        let ptr = self.data.as_mut_ptr();
+                        std::ptr::copy(ptr.add(self.rpos), ptr, count);
+                    }
+                    self.rpos = 0;
+                    unsafe { self.data.set_len(count) };
                 }
+                self.data.reserve(size);
             }
         }
 
-        unsafe { std::slice::from_raw_parts_mut(self.data.as_mut_ptr().add(self.data.len()), size) }
+        unsafe { self.data.as_mut_ptr().add(self.data.len()) }
     }
 
+    #[must_use]
     pub fn commit(&mut self, size: usize) -> bool {
         let len = self.data.len() + size;
         if len > self.data.capacity() {
@@ -212,11 +229,7 @@ impl Buffer {
                 2,
             );
         }
-        if le {
-            v.to_le()
-        } else {
-            v.to_be()
-        }
+        if le { v.to_le() } else { v.to_be() }
     }
 
     pub fn read_u16(&self, pos: usize, le: bool) -> u16 {
@@ -228,11 +241,7 @@ impl Buffer {
                 2,
             );
         }
-        if le {
-            v.to_le()
-        } else {
-            v.to_be()
-        }
+        if le { v.to_le() } else { v.to_be() }
     }
 
     pub fn read_i32(&self, pos: usize, le: bool) -> i32 {
@@ -244,11 +253,7 @@ impl Buffer {
                 4,
             );
         }
-        if le {
-            v.to_le()
-        } else {
-            v.to_be()
-        }
+        if le { v.to_le() } else { v.to_be() }
     }
 
     pub fn read_u32(&self, pos: usize, le: bool) -> u32 {
@@ -260,11 +265,7 @@ impl Buffer {
                 4,
             );
         }
-        if le {
-            v.to_le()
-        } else {
-            v.to_be()
-        }
+        if le { v.to_le() } else { v.to_be() }
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -287,8 +288,60 @@ impl Buffer {
         self as *mut Buffer
     }
 
-    pub fn as_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(self.as_slice()) }
+    pub fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(self.as_slice())
+    }
+
+    /// Shift `count` bytes within the underlying storage from absolute offset `src`
+    /// to absolute offset `dst`. Handles overlapping regions via `memmove`.
+    /// Both `src..src+count` must be within the written data, and
+    /// `dst..dst+count` must be within buffer capacity.
+    pub fn shift_data(&mut self, src: usize, count: usize, dst: usize) {
+        assert!(
+            src + count <= self.data.len(),
+            "shift_data: src({}) + count({}) > data.len({})",
+            src,
+            count,
+            self.data.len()
+        );
+        assert!(
+            dst + count <= self.data.capacity(),
+            "shift_data: dst({}) + count({}) > capacity({})",
+            dst,
+            count,
+            self.data.capacity()
+        );
+        if src == dst || count == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = self.data.as_mut_ptr();
+            std::ptr::copy(ptr.add(src), ptr.add(dst), count);
+        }
+    }
+
+    /// Returns the current write position (absolute offset into the underlying Vec).
+    pub fn write_pos(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns the read position (absolute offset into the underlying Vec).
+    pub fn read_pos(&self) -> usize {
+        self.rpos
+    }
+
+    /// Get a mutable reference to the underlying data at an absolute offset.
+    /// Panics if `offset + len` exceeds the written data length.
+    pub fn data_mut_at(&mut self, offset: usize, len: usize) -> &mut [u8] {
+        assert!(offset + len <= self.data.len());
+        &mut self.data[offset..offset + len]
+    }
+
+    /// Transfer the allocation and its readable offset without moving the
+    /// remaining bytes. Callers that can represent a slice of the allocation
+    /// can avoid the compaction performed by `into_vec`.
+    pub fn into_vec_with_offset(self) -> (Vec<u8>, usize) {
+        (self.data, self.rpos)
     }
 }
 
@@ -333,7 +386,7 @@ impl Default for Buffer {
 
 impl fmt::Display for Buffer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        write!(f, "{}", String::from_utf8_lossy(self.as_slice()))
     }
 }
 
@@ -344,34 +397,34 @@ mod tests {
     #[test]
     fn test_buffer_1() {
         let mut buf = Buffer::with_capacity(12);
-        buf.commit(4);
+        let _ = buf.commit(4);
         buf.write_str("1234567");
         buf.seek(4);
-        assert_eq!(buf.write_front("bbbb".as_bytes()), true);
+        assert!(buf.write_front("bbbb".as_bytes()));
 
-        let r = buf.read(8);
-        println!("{}", String::from_utf8_lossy(r.unwrap().as_ref()));
+        // advance the read cursor by 8 bytes
+        let _ = buf.read(8);
 
         buf.write_str("abcd");
         assert!(buf.read(4).unwrap() == "567a".as_bytes());
-        assert!(buf.len() == 3);
+        assert_eq!(buf.len(), 3);
     }
     #[test]
     fn test_buffer_2() {
         let mut buf = Buffer::with_capacity(128);
-        assert!(buf.len() == 0);
+        assert_eq!(buf.len(), 0);
         let n: i32 = 0;
         buf.write_slice(n.to_le_bytes().as_ref());
         assert_eq!(buf.len(), 4);
         assert!(buf.read(4).unwrap() == n.to_le_bytes().as_ref());
-        assert!(buf.len() == 0);
+        assert_eq!(buf.len(), 0);
         assert!(buf.read(4).is_none());
     }
 
     #[test]
     fn test_buffer_3() {
         let mut buf = Buffer::with_capacity(32);
-        assert!(buf.len() == 0);
+        assert_eq!(buf.len(), 0);
 
         for _ in 0..100 {
             buf.write_slice(vec![0; 17].as_ref());
@@ -427,7 +480,7 @@ mod tests {
     #[test]
     fn test_write_front() {
         let mut buffer = Buffer::new();
-        buffer.commit(1);
+        let _ = buffer.commit(1);
         buffer.write_slice(&[1, 2, 3, 4]);
         buffer.seek(1);
         assert!(buffer.write_front(&[0]));
@@ -437,7 +490,7 @@ mod tests {
     #[test]
     fn test_write_front_byte() {
         let mut buffer = Buffer::new();
-        buffer.commit(1);
+        let _ = buffer.commit(1);
         buffer.write_slice(&[1, 2, 3, 4]);
         buffer.seek(1);
         assert!(buffer.write_front_byte(0));
@@ -606,7 +659,7 @@ mod tests {
     #[test]
     fn test_as_str() {
         let buffer = Buffer::from("hello");
-        assert_eq!(buffer.as_str(), "hello");
+        assert_eq!(buffer.as_str().unwrap(), "hello");
     }
 
     #[test]
@@ -648,5 +701,117 @@ mod tests {
     fn test_display() {
         let buffer = Buffer::from("hello");
         assert_eq!(format!("{}", buffer), "hello");
+    }
+
+    #[test]
+    fn test_shift_data_forward() {
+        let mut buffer = Buffer::from_slice(b"Hello World!");
+        buffer.shift_data(6, 5, 0); // Shift "World" to the beginning
+        assert_eq!(&buffer.data[..5], b"World");
+        // Original data at 6..11 is now also at 0..5
+    }
+
+    #[test]
+    fn test_shift_data_backward() {
+        let mut buffer = Buffer::from_slice(b"Hello World!");
+        buffer.shift_data(0, 5, 7); // Shift "Hello" to position 7
+        assert_eq!(&buffer.data[7..12], b"Hello");
+    }
+
+    #[test]
+    fn test_shift_data_same_position() {
+        let mut buffer = Buffer::from_slice(b"Hello");
+        buffer.shift_data(0, 5, 0); // No-op
+        assert_eq!(&buffer.data, b"Hello");
+    }
+
+    #[test]
+    fn test_write_pos_and_read_pos() {
+        let mut buffer = Buffer::from_slice(b"Hello");
+        assert_eq!(buffer.write_pos(), 5);
+        assert_eq!(buffer.read_pos(), 0);
+        buffer.consume(2);
+        assert_eq!(buffer.write_pos(), 5);
+        assert_eq!(buffer.read_pos(), 2);
+    }
+
+    #[test]
+    fn test_data_mut_at() {
+        let mut buffer = Buffer::from_slice(b"Hello World");
+        buffer.data_mut_at(6, 5).copy_from_slice(b"Rust!");
+        assert_eq!(&buffer.data, b"Hello Rust!");
+    }
+
+    #[test]
+    fn test_prepare_reuses_consumed_space_before_growing() {
+        let mut buffer = Buffer::with_capacity(8);
+        buffer.write_slice(b"abcdef");
+        assert_eq!(buffer.read(4).unwrap(), b"abcd");
+
+        let old_capacity = buffer.data.capacity();
+        let ptr = buffer.prepare(4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"ghij".as_ptr(), ptr, 4);
+        }
+        assert!(buffer.commit(4));
+
+        assert_eq!(buffer.data.capacity(), old_capacity);
+        assert_eq!(buffer.read_pos(), 0);
+        assert_eq!(buffer.as_slice(), b"efghij");
+    }
+
+    #[test]
+    fn test_prepare_grows_when_consumed_space_is_not_enough() {
+        let mut buffer = Buffer::with_capacity(8);
+        buffer.write_slice(b"abcdef");
+        assert_eq!(buffer.read(2).unwrap(), b"ab");
+
+        let old_capacity = buffer.data.capacity();
+        let ptr = buffer.prepare(5);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"ghijk".as_ptr(), ptr, 5);
+        }
+        assert!(buffer.commit(5));
+
+        assert!(buffer.data.capacity() > old_capacity);
+        assert_eq!(buffer.read_pos(), 0);
+        assert_eq!(buffer.as_slice(), b"cdefghijk");
+    }
+
+    #[test]
+    fn test_write_front_failure_keeps_state_unchanged() {
+        let mut buffer = Buffer::from_slice(b"payload");
+        assert!(!buffer.write_front(b"H"));
+        assert_eq!(buffer.read_pos(), 0);
+        assert_eq!(buffer.write_pos(), 7);
+        assert_eq!(buffer.as_slice(), b"payload");
+    }
+
+    #[test]
+    fn test_write_front_byte_failure_keeps_state_unchanged() {
+        let mut buffer = Buffer::from_slice(b"payload");
+        assert!(!buffer.write_front_byte(b'H'));
+        assert_eq!(buffer.read_pos(), 0);
+        assert_eq!(buffer.write_pos(), 7);
+        assert_eq!(buffer.as_slice(), b"payload");
+    }
+
+    #[test]
+    fn test_commit_over_capacity_keeps_len_unchanged() {
+        let mut buffer = Buffer::with_capacity(4);
+        buffer.write_slice(b"abcd");
+
+        assert!(!buffer.commit(1));
+        assert_eq!(buffer.write_pos(), 4);
+        assert_eq!(buffer.as_slice(), b"abcd");
+    }
+
+    #[test]
+    fn test_consume_past_readable_is_noop() {
+        let mut buffer = Buffer::from_slice(b"abc");
+        buffer.consume(4);
+
+        assert_eq!(buffer.read_pos(), 0);
+        assert_eq!(buffer.as_slice(), b"abc");
     }
 }

@@ -1,33 +1,329 @@
-use std::sync::{Arc, atomic::AtomicI64};
-use std::time::Duration;
-
-use dashmap::DashMap;
-use lazy_static::lazy_static;
-use sqlx::types::Uuid;
-use sqlx::{
-    Column, ColumnIndex, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite, SqlitePool,
-    TypeInfo, ValueRef,
-    migrate::MigrateDatabase,
-    mysql::MySqlRow,
-    postgres::{PgPoolOptions, PgRow},
-    sqlite::SqliteRow,
-    types::chrono::{NaiveDate, NaiveDateTime, NaiveTime},
-};
-use tokio::{sync::mpsc, time::timeout};
-
-use lib_core::context::CONTEXT;
-use lib_lua::{
-    self, cstr, ffi, laux,
-    laux::{LuaArgs, LuaNil, LuaState, LuaTable, LuaValue, lua_into_userdata},
-    lreg, lreg_null, luaL_newlib, push_lua_table,
-};
-
 use crate::lua_json::{JsonOptions, encode_table};
-use crate::{LOG_LEVEL_ERROR, LOG_LEVEL_INFO, moon_log, moon_send};
+use crate::request_pool::{
+    PendingCounter, QueuedRequest, dispatch_request, drain_queued_requests, notify_shutdown,
+};
+use bigdecimal::{BigDecimal, ToPrimitive};
+use dashmap::DashMap;
+use futures_util::TryStreamExt;
+use lazy_static::lazy_static;
+use lib_core::context::CONTEXT;
+use lib_lua::laux::{LuaStack, LuaState};
+use lib_lua::{
+    cstr, ffi, laux,
+    laux::{LuaArgs, LuaTable, LuaType},
+    lreg, lreg_null, lreg_try, luaL_newlib, push_lua_table,
+};
+type ActorId = u32;
+use phf::phf_map;
+use sqlx::{
+    self, Column, ColumnIndex, Database, MySql, MySqlPool, PgPool, Postgres, Row, Sqlite,
+    SqlitePool, TypeInfo, ValueRef,
+    migrate::MigrateDatabase,
+    mysql::{MySqlPoolOptions, MySqlRow},
+    postgres::{PgPoolOptions, PgRow},
+    sqlite::{SqlitePoolOptions, SqliteRow},
+};
+use std::{ffi::c_int, sync::Arc, time::Duration};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 
 lazy_static! {
-    static ref DATABASE_CONNECTIONSS: DashMap<String, DatabaseConnection> = DashMap::new();
+    static ref DATABASE_CONNECTIONS: DashMap<String, DatabaseConnection> = DashMap::new();
 }
+
+// ---------------------------------------------------------------------------
+// Column type classification
+// ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone)]
+enum DbType {
+    Null,
+    Bool,
+    Integer,
+    UnsignedInteger,
+    Float32,
+    Float64,
+    Text,
+    Json,
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+    Uuid,
+    Binary,
+    Decimal,
+    Unknown,
+}
+
+static DB_TYPE_MAP: phf::Map<&'static str, DbType> = phf_map! {
+    "NULL" => DbType::Null,
+    "BOOL" => DbType::Bool,
+    "BOOLEAN" => DbType::Bool,
+    // Integer
+    "INT2" => DbType::Integer,
+    "INT4" => DbType::Integer,
+    "INT8" => DbType::Integer,
+    "TINYINT" => DbType::Integer,
+    "SMALLINT" => DbType::Integer,
+    "INT" => DbType::Integer,
+    "MEDIUMINT" => DbType::Integer,
+    "BIGINT" => DbType::Integer,
+    "INTEGER" => DbType::Integer,
+    "TINYINT UNSIGNED" => DbType::UnsignedInteger,
+    "SMALLINT UNSIGNED" => DbType::UnsignedInteger,
+    "INT UNSIGNED" => DbType::UnsignedInteger,
+    "MEDIUMINT UNSIGNED" => DbType::UnsignedInteger,
+    "BIGINT UNSIGNED" => DbType::UnsignedInteger,
+    // Decimal
+    "NUMERIC" => DbType::Decimal,
+    "DECIMAL" => DbType::Decimal,
+    // Float
+    "FLOAT4" => DbType::Float32,
+    "REAL" => DbType::Float32,
+    "FLOAT8" => DbType::Float64,
+    "FLOAT" => DbType::Float64,
+    "DOUBLE" => DbType::Float64,
+    // Text
+    "TEXT" => DbType::Text,
+    "VARCHAR" => DbType::Text,
+    "CHAR" => DbType::Text,
+    "BPCHAR" => DbType::Text,
+    "NAME" => DbType::Text,
+    // JSON
+    "JSON" => DbType::Json,
+    "JSONB" => DbType::Json,
+    // Date / Time
+    "DATE" => DbType::Date,
+    "TIME" => DbType::Time,
+    "TIMETZ" => DbType::Time,
+    "TIMESTAMP" => DbType::Timestamp,
+    "DATETIME" => DbType::Timestamp,
+    "TIMESTAMPTZ" => DbType::TimestampTz,
+    // UUID
+    "UUID" => DbType::Uuid,
+    // Binary blob
+    "BLOB" => DbType::Binary,
+    "BYTEA" => DbType::Binary,
+    "BINARY" => DbType::Binary,
+    "VARBINARY" => DbType::Binary,
+};
+
+impl DbType {
+    fn from_name(name: &str) -> Self {
+        DB_TYPE_MAP.get(name).copied().unwrap_or(Self::Unknown)
+    }
+}
+
+// MySQL unsigned integers have distinct metadata and may exceed Lua's i64 range.
+struct UnsignedValue(u64);
+macro_rules! impl_unsigned_decode {
+    ($db:ty, $integer:ty) => {
+        impl<'r> sqlx::Decode<'r, $db> for UnsignedValue {
+            fn decode(
+                value: <$db as Database>::ValueRef<'r>,
+            ) -> Result<Self, sqlx::error::BoxDynError> {
+                let value = <$integer as sqlx::Decode<$db>>::decode(value)?;
+                Ok(Self(value.try_into()?))
+            }
+        }
+    };
+}
+impl_unsigned_decode!(MySql, u64);
+impl_unsigned_decode!(Postgres, i64);
+impl_unsigned_decode!(Sqlite, i64);
+
+// Local wrapper keeps the generic row decoder usable with SQLite, for which
+// SQLx deliberately does not implement BigDecimal decoding.
+struct DecimalValue(BigDecimal);
+
+macro_rules! impl_decimal_decode {
+    ($db:ty) => {
+        impl<'r> sqlx::Decode<'r, $db> for DecimalValue {
+            fn decode(
+                value: <$db as Database>::ValueRef<'r>,
+            ) -> Result<Self, sqlx::error::BoxDynError> {
+                <BigDecimal as sqlx::Decode<$db>>::decode(value).map(Self)
+            }
+        }
+    };
+}
+
+impl_decimal_decode!(Postgres);
+impl_decimal_decode!(MySql);
+
+impl<'r> sqlx::Decode<'r, Sqlite> for DecimalValue {
+    fn decode(value: <Sqlite as Database>::ValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        // SQLite normally reports INTEGER/REAL/TEXT storage types. If decimal
+        // metadata is encountered, parse its textual representation; precision
+        // already lost to SQLite REAL storage cannot be recovered here.
+        let text = <&str as sqlx::Decode<Sqlite>>::decode(value)?;
+        Ok(Self(text.parse()?))
+    }
+}
+
+fn decimal_integer(value: &BigDecimal) -> Option<i64> {
+    // ToPrimitive alone truncates fractional values.
+    value.is_integer().then(|| value.to_i64()).flatten()
+}
+
+// ---------------------------------------------------------------------------
+// Direct row → Lua pusher (no intermediate clone)
+// ---------------------------------------------------------------------------
+
+fn process_rows<'a, DB>(state: LuaState, rows: &'a [<DB as Database>::Row]) -> c_int
+where
+    DB: sqlx::Database,
+    usize: ColumnIndex<<DB as Database>::Row>,
+    bool: sqlx::Decode<'a, DB>,
+    i64: sqlx::Decode<'a, DB>,
+    f32: sqlx::Decode<'a, DB>,
+    f64: sqlx::Decode<'a, DB>,
+    &'a str: sqlx::Decode<'a, DB>,
+    &'a [u8]: sqlx::Decode<'a, DB>,
+    chrono::NaiveDate: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    chrono::NaiveTime: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    chrono::NaiveDateTime: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    chrono::DateTime<chrono::Utc>: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    uuid::Uuid: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+    DecimalValue: sqlx::Decode<'a, DB>,
+    UnsignedValue: sqlx::Decode<'a, DB>,
+    serde_json::Value: sqlx::Decode<'a, DB> + sqlx::Type<DB>,
+{
+    let table = LuaTable::new(state, rows.len(), 0);
+    if rows.is_empty() {
+        return 1;
+    }
+
+    let first = &rows[0];
+    let col_info: Vec<(usize, &str, DbType)> = first
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, c.name(), DbType::from_name(c.type_info().name())))
+        .collect();
+
+    for (i, row) in rows.iter().enumerate() {
+        let row_table = LuaTable::new(state, 0, col_info.len());
+        for &(index, col_name, db_type) in &col_info {
+            match row.try_get_raw(index) {
+                Ok(value) if value.is_null() => {}
+                Ok(value) => {
+                    // SQLite expression columns can have NULL metadata even
+                    // when a row contains a value. Resolve those types per row.
+                    let db_type = if matches!(db_type, DbType::Null | DbType::Unknown) {
+                        DbType::from_name(value.type_info().name())
+                    } else {
+                        db_type
+                    };
+                    match db_type {
+                        DbType::Null => {}
+                        DbType::Bool => {
+                            row_table.insert(
+                                col_name,
+                                sqlx::decode::Decode::decode(value).unwrap_or(false),
+                            );
+                        }
+                        DbType::Integer => {
+                            row_table.insert(
+                                col_name,
+                                sqlx::decode::Decode::decode(value).unwrap_or(0i64),
+                            );
+                        }
+                        DbType::UnsignedInteger => {
+                            if let Ok(UnsignedValue(value)) = sqlx::Decode::decode(value) {
+                                match i64::try_from(value) {
+                                    Ok(integer) => {
+                                        row_table.insert(col_name, integer);
+                                    }
+                                    Err(_) => {
+                                        row_table.insert(col_name, value.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        DbType::Float32 => {
+                            let v: f32 = sqlx::decode::Decode::decode(value).unwrap_or(0.0);
+                            row_table.insert(col_name, v as f64);
+                        }
+                        DbType::Float64 => {
+                            row_table.insert(
+                                col_name,
+                                sqlx::decode::Decode::decode(value).unwrap_or(0.0f64),
+                            );
+                        }
+                        DbType::Decimal => {
+                            if let Ok(DecimalValue(v)) =
+                                <DecimalValue as sqlx::Decode<DB>>::decode(value)
+                            {
+                                if let Some(integer) = decimal_integer(&v) {
+                                    row_table.insert(col_name, integer);
+                                } else {
+                                    let s = v.to_string();
+                                    row_table.insert(col_name, s.as_str());
+                                }
+                            }
+                        }
+                        DbType::Text => {
+                            let v: &str = sqlx::decode::Decode::decode(value).unwrap_or("");
+                            row_table.insert(col_name, v);
+                        }
+                        DbType::Json => {
+                            if let Ok(v) = <serde_json::Value as sqlx::Decode<DB>>::decode(value) {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Date => {
+                            if let Ok(v) = <chrono::NaiveDate as sqlx::Decode<DB>>::decode(value) {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Time => {
+                            if let Ok(v) = <chrono::NaiveTime as sqlx::Decode<DB>>::decode(value) {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Timestamp => {
+                            if let Ok(v) =
+                                <chrono::NaiveDateTime as sqlx::Decode<DB>>::decode(value)
+                            {
+                                let s = v.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::TimestampTz => {
+                            if let Ok(v) =
+                                <chrono::DateTime<chrono::Utc> as sqlx::Decode<DB>>::decode(value)
+                            {
+                                let s = v.to_rfc3339();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Uuid => {
+                            if let Ok(v) = <uuid::Uuid as sqlx::Decode<DB>>::decode(value) {
+                                let s = v.to_string();
+                                row_table.insert(col_name, s.as_str());
+                            }
+                        }
+                        DbType::Binary | DbType::Unknown => {
+                            let v: &[u8] = sqlx::decode::Decode::decode(value).unwrap_or(b"");
+                            row_table.insert(col_name, v);
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        table.rawseti(i + 1);
+    }
+    1
+}
+
+// ---------------------------------------------------------------------------
+// Database pool
+// ---------------------------------------------------------------------------
 
 enum DatabasePool {
     MySql(MySqlPool),
@@ -36,7 +332,11 @@ enum DatabasePool {
 }
 
 impl DatabasePool {
-    async fn connect(database_url: &str, timeout_duration: Duration) -> Result<Self, sqlx::Error> {
+    async fn connect(
+        database_url: &str,
+        timeout_duration: Duration,
+        max_connections: u32,
+    ) -> Result<Self, sqlx::Error> {
         async fn connect_with_timeout<F, T>(
             timeout_duration: Duration,
             connect_future: F,
@@ -47,30 +347,49 @@ impl DatabasePool {
             timeout(timeout_duration, connect_future)
                 .await
                 .map_err(|err| {
-                    sqlx::Error::Io(std::io::Error::other(format!("Connection error: {}", err)))
+                    sqlx::Error::Io(std::io::Error::other(format!(
+                        "sqlx: connection timeout: {}",
+                        err
+                    )))
                 })?
         }
 
+        let acquire_timeout = timeout_duration;
+
         if database_url.starts_with("mysql://") {
-            let pool =
-                connect_with_timeout(timeout_duration, MySqlPool::connect(database_url)).await?;
+            let pool = connect_with_timeout(
+                timeout_duration,
+                MySqlPoolOptions::new()
+                    .max_connections(max_connections)
+                    .acquire_timeout(acquire_timeout)
+                    .connect(database_url),
+            )
+            .await?;
             Ok(DatabasePool::MySql(pool))
-        } else if database_url.starts_with("postgres://") {
+        } else if database_url.starts_with("postgres://")
+            || database_url.starts_with("postgresql://")
+        {
             let pool = connect_with_timeout(
                 timeout_duration,
                 PgPoolOptions::new()
-                    .max_connections(1)
-                    .acquire_timeout(Duration::from_secs(2))
+                    .max_connections(max_connections)
+                    .acquire_timeout(acquire_timeout)
                     .connect(database_url),
             )
             .await?;
             Ok(DatabasePool::Postgres(pool))
-        } else if database_url.starts_with("sqlite://") {
+        } else if database_url.starts_with("sqlite:") {
             if !Sqlite::database_exists(database_url).await? {
                 Sqlite::create_database(database_url).await?;
             }
-            let pool =
-                connect_with_timeout(timeout_duration, SqlitePool::connect(database_url)).await?;
+            let pool = connect_with_timeout(
+                timeout_duration,
+                SqlitePoolOptions::new()
+                    .max_connections(max_connections)
+                    .acquire_timeout(acquire_timeout)
+                    .connect(database_url),
+            )
+            .await?;
             Ok(DatabasePool::Sqlite(pool))
         } else {
             Err(sqlx::Error::Configuration(
@@ -79,27 +398,32 @@ impl DatabasePool {
         }
     }
 
-    fn make_query<'a, DB: sqlx::Database>(
-        sql: &'a str,
-        binds: &'a [QueryParams],
-    ) -> Result<sqlx::query::Query<'a, DB, <DB as sqlx::Database>::Arguments<'a>>, sqlx::Error>
+    /// Build a parameterized query. **Trust requirement:** the `sql` string is
+    /// passed to the driver verbatim via `sqlx::AssertSqlSafe` — only the `binds`
+    /// are parameterized. The caller (Lua) is responsible for ensuring `sql` is a
+    /// trusted, statically-known statement; never build it by concatenating
+    /// untrusted input. Use `$1`/`?` placeholders + binds for all values.
+    fn make_query<DB: sqlx::Database>(
+        sql: Arc<String>,
+        binds: &[QueryParams],
+    ) -> Result<sqlx::query::Query<'static, DB, <DB as sqlx::Database>::Arguments>, sqlx::Error>
     where
-        bool: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        i64: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        f64: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        &'a str: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        serde_json::Value: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
-        &'a Vec<u8>: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+        bool: for<'q> sqlx::Encode<'q, DB> + sqlx::Type<DB>,
+        i64: for<'q> sqlx::Encode<'q, DB> + sqlx::Type<DB>,
+        f64: for<'q> sqlx::Encode<'q, DB> + sqlx::Type<DB>,
+        String: for<'q> sqlx::Encode<'q, DB> + sqlx::Type<DB>,
+        serde_json::Value: for<'q> sqlx::Encode<'q, DB> + sqlx::Type<DB>,
+        Vec<u8>: for<'q> sqlx::Encode<'q, DB> + sqlx::Type<DB>,
     {
-        let mut query = sqlx::query(sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for bind in binds {
             query = match bind {
                 QueryParams::Bool(value) => query.bind(*value),
                 QueryParams::Int(value) => query.bind(*value),
                 QueryParams::Float(value) => query.bind(*value),
-                QueryParams::Text(value) => query.bind(value.as_str()),
-                QueryParams::Json(value) => query.bind(value),
-                QueryParams::Bytes(value) => query.bind(value),
+                QueryParams::Text(value) => query.bind(value.clone()),
+                QueryParams::Json(value) => query.bind(value.clone()),
+                QueryParams::Bytes(value) => query.bind(value.clone()),
             };
         }
         Ok(query)
@@ -108,18 +432,18 @@ impl DatabasePool {
     async fn query(&self, request: &DatabaseQuery) -> Result<DatabaseResponse, sqlx::Error> {
         match self {
             DatabasePool::MySql(pool) => {
-                let query = Self::make_query(&request.sql, &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
+                let query = Self::make_query(request.sql.clone(), &request.binds)?;
+                let rows = collect_capped(query.fetch(pool)).await?;
                 Ok(DatabaseResponse::MysqlRows(rows))
             }
             DatabasePool::Postgres(pool) => {
-                let query = Self::make_query(&request.sql, &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
+                let query = Self::make_query(request.sql.clone(), &request.binds)?;
+                let rows = collect_capped(query.fetch(pool)).await?;
                 Ok(DatabaseResponse::PgRows(rows))
             }
             DatabasePool::Sqlite(pool) => {
-                let query = Self::make_query(&request.sql, &request.binds)?;
-                let rows = query.fetch_all(pool).await?;
+                let query = Self::make_query(request.sql.clone(), &request.binds)?;
+                let rows = collect_capped(query.fetch(pool)).await?;
                 Ok(DatabaseResponse::SqliteRows(rows))
             }
         }
@@ -129,48 +453,94 @@ impl DatabasePool {
         &self,
         requests: &[DatabaseQuery],
     ) -> Result<DatabaseResponse, sqlx::Error> {
+        macro_rules! do_transaction {
+            ($pool:expr) => {{
+                let mut tx = $pool.begin().await?;
+                for request in requests {
+                    let query = Self::make_query(request.sql.clone(), &request.binds)?;
+                    query.execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+                Ok(DatabaseResponse::Transaction)
+            }};
+        }
         match self {
-            DatabasePool::MySql(pool) => {
-                let mut transaction = pool.begin().await?;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    query.execute(&mut *transaction).await?;
-                }
-                transaction.commit().await?;
-                Ok(DatabaseResponse::Transaction)
-            }
-            DatabasePool::Postgres(pool) => {
-                let mut transaction = pool.begin().await?;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    query.execute(&mut *transaction).await?;
-                }
-                transaction.commit().await?;
-                Ok(DatabaseResponse::Transaction)
-            }
-            DatabasePool::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
-                for request in requests {
-                    let query = Self::make_query(&request.sql, &request.binds)?;
-                    query.execute(&mut *transaction).await?;
-                }
-                transaction.commit().await?;
-                Ok(DatabaseResponse::Transaction)
-            }
+            DatabasePool::MySql(pool) => do_transaction!(pool),
+            DatabasePool::Postgres(pool) => do_transaction!(pool),
+            DatabasePool::Sqlite(pool) => do_transaction!(pool),
+        }
+    }
+}
+
+/// Drain a row stream into a `Vec`, failing fast once it would exceed
+/// `crate::LIMITS.db_query_rows`. This bounds the memory a single non-streaming
+/// `query` can buffer; large result sets must use the streaming cursor API.
+async fn collect_capped<S, R>(mut stream: S) -> Result<Vec<R>, sqlx::Error>
+where
+    S: futures_util::Stream<Item = Result<R, sqlx::Error>> + Unpin,
+{
+    let mut rows = Vec::new();
+    while let Some(row) = stream.try_next().await? {
+        if rows.len() >= crate::LIMITS.db_query_rows {
+            return Err(sqlx::Error::Protocol(format!(
+                "query returned more than {} rows; use query_stream for large result sets",
+                crate::LIMITS.db_query_rows
+            )));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Request / Response / Connection types
+// ---------------------------------------------------------------------------
+
+enum CursorSignal {
+    Next(ActorId, i64),
+    Close,
+}
+
+struct SqlxCursorHandle(Option<oneshot::Sender<CursorSignal>>);
+
+impl Drop for SqlxCursorHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(CursorSignal::Close);
         }
     }
 }
 
 enum DatabaseRequest {
-    Query(u32, i64, DatabaseQuery), //owner, session, QueryBuilder
-    Transaction(u32, i64, Vec<DatabaseQuery>), //owner, session, Vec<QueryBuilder>
+    Query(ActorId, i64, DatabaseQuery),
+    QueryStream(ActorId, i64, DatabaseQuery, usize),
+    Transaction(ActorId, i64, Vec<DatabaseQuery>),
     Close(),
+}
+
+impl DatabaseRequest {
+    /// `(owner, session)` for requests that the handler increments the
+    /// backpressure counter for and may reply to; `None` for `Close`.
+    fn owner_session(&self) -> Option<(ActorId, i64)> {
+        match self {
+            DatabaseRequest::Query(owner, session, _)
+            | DatabaseRequest::QueryStream(owner, session, _, _)
+            | DatabaseRequest::Transaction(owner, session, _) => Some((*owner, *session)),
+            DatabaseRequest::Close() => None,
+        }
+    }
+}
+
+impl QueuedRequest for DatabaseRequest {
+    fn owner_session(&self) -> Option<(ActorId, i64)> {
+        DatabaseRequest::owner_session(self)
+    }
 }
 
 #[derive(Clone)]
 struct DatabaseConnection {
     tx: mpsc::Sender<DatabaseRequest>,
-    counter: Arc<AtomicI64>,
+    counter: PendingCounter,
 }
 
 enum DatabaseResponse {
@@ -178,6 +548,9 @@ enum DatabaseResponse {
     PgRows(Vec<PgRow>),
     MysqlRows(Vec<MySqlRow>),
     SqliteRows(Vec<SqliteRow>),
+    PgBatch(Vec<PgRow>, Option<oneshot::Sender<CursorSignal>>),
+    MysqlBatch(Vec<MySqlRow>, Option<oneshot::Sender<CursorSignal>>),
+    SqliteBatch(Vec<SqliteRow>, Option<oneshot::Sender<CursorSignal>>),
     Error(sqlx::Error),
     Timeout(String),
     Transaction,
@@ -195,50 +568,79 @@ enum QueryParams {
 
 #[derive(Debug, Clone)]
 struct DatabaseQuery {
-    sql: String,
+    sql: Arc<String>,
     binds: Vec<QueryParams>,
+}
+
+struct TransactionQueries {
+    queries: Vec<DatabaseQuery>,
+}
+
+// ---------------------------------------------------------------------------
+// Async handler
+// ---------------------------------------------------------------------------
+
+/// Whether a `sqlx::Error` is a transient connection/IO failure worth retrying,
+/// as opposed to a logical error (bad SQL, constraint violation, decode error)
+/// that will fail identically on every retry. Used to gate the fire-and-forget
+/// (`session == 0`) self-heal retry so a permanent error can't wedge the
+/// single-threaded handler in an infinite loop.
+fn is_transient_sqlx_error(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed
+    )
 }
 
 async fn handle_result(
     database_url: &str,
     failed_times: &mut i32,
-    counter: &Arc<AtomicI64>,
     protocol_type: u8,
-    owner: u32,
+    owner: ActorId,
     session: i64,
     res: Result<DatabaseResponse, sqlx::Error>,
 ) -> bool {
     match res {
         Ok(rows) => {
-            moon_send(protocol_type, owner, session, rows);
+            if session != 0 {
+                let _ = crate::moon_send(protocol_type, owner, session, rows);
+            }
             if *failed_times > 0 {
-                moon_log(
-                    owner,
-                    LOG_LEVEL_INFO,
-                    format!(
-                        "Database '{}' recover from error. Retry success.",
-                        database_url
-                    ),
+                log::info!(
+                    "Database '{}' recover from error. Retry success.",
+                    database_url
                 );
             }
-            counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
             false
         }
         Err(err) => {
             if session != 0 {
-                moon_send(protocol_type, owner, session, DatabaseResponse::Error(err));
-                counter.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                let _ =
+                    crate::moon_send(protocol_type, owner, session, DatabaseResponse::Error(err));
                 false
             } else {
+                // Fire-and-forget (session == 0): there is no caller to receive
+                // the error. Only self-heal on transient connection errors; a
+                // logical error (bad SQL, constraint violation, ...) fails the
+                // same way on every retry, so drop it instead of looping forever
+                // and wedging this single-threaded handler.
+                if !is_transient_sqlx_error(&err) {
+                    log::error!(
+                        "Database '{}' permanent error: '{}'. Dropped (fire-and-forget, no retry).",
+                        database_url,
+                        err
+                    );
+                    return false;
+                }
                 if *failed_times > 0 {
-                    moon_log(
-                        owner,
-                        LOG_LEVEL_ERROR,
-                        format!(
-                            "Database '{}' error: '{:?}'. Will retry.",
-                            database_url,
-                            err.to_string()
-                        ),
+                    log::error!(
+                        "Database '{}' transient error: '{}'. Will retry.",
+                        database_url,
+                        err
                     );
                 }
                 *failed_times += 1;
@@ -250,20 +652,22 @@ async fn handle_result(
 }
 
 async fn database_handler(
+    name: String,
     protocol_type: u8,
     pool: &DatabasePool,
     mut rx: mpsc::Receiver<DatabaseRequest>,
     database_url: &str,
-    counter: Arc<AtomicI64>,
+    counter: PendingCounter,
 ) {
     while let Some(op) = rx.recv().await {
+        // Keep retries and the full streaming lifetime in the pending count.
+        let _pending = op.owner_session().map(|_| counter.finish_on_drop());
         let mut failed_times = 0;
         match &op {
             DatabaseRequest::Query(owner, session, query_op) => {
                 while handle_result(
                     database_url,
                     &mut failed_times,
-                    &counter,
                     protocol_type,
                     *owner,
                     *session,
@@ -276,7 +680,6 @@ async fn database_handler(
                 while handle_result(
                     database_url,
                     &mut failed_times,
-                    &counter,
                     protocol_type,
                     *owner,
                     *session,
@@ -285,39 +688,153 @@ async fn database_handler(
                 .await
                 {}
             }
+            DatabaseRequest::QueryStream(owner, session, query_op, batch_size) => {
+                let batch_size = *batch_size;
+                let mut current_owner = *owner;
+                let mut current_session = *session;
+
+                macro_rules! do_stream {
+                    ($pool:expr, $variant:ident) => {{
+                        let query_result =
+                            DatabasePool::make_query(query_op.sql.clone(), &query_op.binds);
+                        match query_result {
+                            Ok(q) => {
+                                let mut stream = q.fetch($pool);
+                                loop {
+                                    let mut batch = Vec::with_capacity(batch_size);
+                                    let mut errored = false;
+                                    for _ in 0..batch_size {
+                                        match stream.try_next().await {
+                                            Ok(Some(row)) => batch.push(row),
+                                            Ok(None) => break,
+                                            Err(err) => {
+                                                crate::response_error(
+                                                    0,
+                                                    current_owner,
+                                                    -current_session,
+                                                    err.to_string(),
+                                                );
+                                                errored = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if errored {
+                                        break;
+                                    }
+
+                                    let cursor_exhausted = batch.len() < batch_size;
+                                    let (next_tx, next_rx) = if !cursor_exhausted {
+                                        let (tx, rx) = oneshot::channel();
+                                        (Some(tx), Some(rx))
+                                    } else {
+                                        (None, None)
+                                    };
+
+                                    let _ = crate::moon_send(
+                                        protocol_type,
+                                        current_owner,
+                                        current_session,
+                                        DatabaseResponse::$variant(batch, next_tx),
+                                    );
+
+                                    // `next_rx` is `Some` iff the cursor isn't exhausted.
+                                    let Some(next_rx) = next_rx else { break };
+                                    match next_rx.await {
+                                        Ok(CursorSignal::Next(new_owner, new_session)) => {
+                                            current_owner = new_owner;
+                                            current_session = new_session;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                crate::response_error(
+                                    0,
+                                    current_owner,
+                                    -current_session,
+                                    err.to_string(),
+                                );
+                            }
+                        }
+                    }};
+                }
+
+                match pool {
+                    DatabasePool::MySql(p) => do_stream!(p, MysqlBatch),
+                    DatabasePool::Postgres(p) => do_stream!(p, PgBatch),
+                    DatabasePool::Sqlite(p) => do_stream!(p, SqliteBatch),
+                }
+            }
             DatabaseRequest::Close() => {
+                drain_queued_requests(&mut rx, &counter, |owner, session| {
+                    crate::response_error(0, owner, -session, "sqlx connection closed".to_string());
+                })
+                .await;
                 break;
             }
         }
     }
+    // Only remove our own registry entry. If this handler is being superseded by
+    // a `connect()` of the same name, the new entry is already in place and must
+    // not be deleted — match on our own pending counter to identify ourselves.
+    DATABASE_CONNECTIONS.remove_if(&name, |_, v| v.counter.ptr_eq(&counter));
+    log::info!("Database connection '{}' closed and removed.", name);
 }
 
-extern "C-unwind" fn connect(state: LuaState) -> i32 {
-    let protocol_type: u8 = laux::lua_get(state, 1);
-    let owner = laux::lua_get(state, 2);
-    let session: i64 = laux::lua_get(state, 3);
+// ---------------------------------------------------------------------------
+// Lua-facing functions
+// ---------------------------------------------------------------------------
 
-    let database_url: &str = laux::lua_get(state, 4);
-    let name: &str = laux::lua_get(state, 5);
-    let connect_timeout: u64 = laux::lua_opt(state, 6).unwrap_or(5000);
+fn connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let (owner, session) = crate::take_route(lua, 1)?;
+    let state = lua.state();
+    let database_url = lua
+        .get::<String>(1)
+        .map_err(|err| format!("sqlx.connect: {err}"))?;
+    let name = lua
+        .get::<String>(2)
+        .map_err(|err| format!("sqlx.connect: {err}"))?;
+    let connect_timeout: u64 = lua.opt(3).unwrap_or(5000);
+    let max_connections: u32 = lua.opt(4).unwrap_or(crate::LIMITS.db_pool_size);
+    let queue_capacity: usize = lua.opt(5).unwrap_or(crate::LIMITS.request_queue_capacity);
+    let queue_capacity = queue_capacity.max(1);
+    let protocol_type = 23;
 
     CONTEXT.tokio_runtime.spawn(async move {
-        match DatabasePool::connect(database_url, Duration::from_millis(connect_timeout)).await {
+        match DatabasePool::connect(
+            &database_url,
+            Duration::from_millis(connect_timeout),
+            max_connections,
+        )
+        .await
+        {
             Ok(pool) => {
-                let (tx, rx) = mpsc::channel(100);
-                let counter = Arc::new(AtomicI64::new(0));
-                DATABASE_CONNECTIONSS.insert(
+                let (tx, rx) = mpsc::channel(queue_capacity);
+                let counter = PendingCounter::new();
+                // Replacing an existing connection of the same name: tell the
+                // previous handler to close so its task and pool don't leak. Its
+                // exit removal is guarded (see `database_handler`) so it won't
+                // delete the entry we insert here.
+                if let Some(old) = DATABASE_CONNECTIONS.insert(
                     name.to_string(),
                     DatabaseConnection {
                         tx: tx.clone(),
                         counter: counter.clone(),
                     },
-                );
-                moon_send(protocol_type, owner, session, DatabaseResponse::Connect);
-                database_handler(protocol_type, &pool, rx, database_url, counter).await;
+                ) {
+                    log::warn!(
+                        "sqlx '{}' reconnected with the same name; closing the previous connection",
+                        name
+                    );
+                    notify_shutdown(&old.tx, DatabaseRequest::Close());
+                }
+                let _ = crate::moon_send(protocol_type, owner, session, DatabaseResponse::Connect);
+                database_handler(name, protocol_type, &pool, rx, &database_url, counter).await;
             }
             Err(err) => {
-                moon_send(
+                let _ = crate::moon_send(
                     protocol_type,
                     owner,
                     session,
@@ -328,34 +845,47 @@ extern "C-unwind" fn connect(state: LuaState) -> i32 {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
-fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
+const SQLX_JSON_PARAM_META: *const std::ffi::c_char = cstr!("sqlx_json_param");
+
+fn make_json_param(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let value: serde_json::Value = {
+        let source = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "sqlx.json: UTF-8 string expected".to_string())?;
+        serde_json::from_str(source).map_err(|e| format!("sqlx.json: invalid JSON: {e}"))?
+    };
+    laux::lua_newuserdata(state, value, SQLX_JSON_PARAM_META, &[lreg_null!()]);
+    Ok(1)
+}
+
+fn get_query_param(lua: &mut LuaStack<'_>, i: i32) -> Result<QueryParams, String> {
+    let state = lua.state();
     let options = JsonOptions::default();
 
-    let res = match LuaValue::from_stack(state, i) {
-        LuaValue::Boolean(val) => QueryParams::Bool(val),
-        LuaValue::Number(val) => QueryParams::Float(val),
-        LuaValue::Integer(val) => QueryParams::Int(val),
-        LuaValue::String(val) => {
-            if val.starts_with(b"{") || val.starts_with(b"[") {
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(val) {
-                    QueryParams::Json(value)
-                } else {
-                    QueryParams::Text(unsafe { String::from_utf8_unchecked(val.to_vec()) })
-                }
-            } else {
-                QueryParams::Text(unsafe { String::from_utf8_unchecked(val.to_vec()) })
-            }
-        }
-        LuaValue::Table(val) => {
+    let ptr = unsafe { ffi::luaL_testudata(state.as_ptr(), i, SQLX_JSON_PARAM_META) };
+    if !ptr.is_null() {
+        let value = unsafe { &*(ptr as *const serde_json::Value) };
+        return Ok(QueryParams::Json(value.clone()));
+    }
+
+    let value = lua.value(i);
+    let res = match value.kind() {
+        LuaType::Boolean => QueryParams::Bool(value.as_bool().unwrap_or(false)),
+        LuaType::Number => QueryParams::Float(value.as_number().unwrap_or_default()),
+        LuaType::Integer => QueryParams::Int(value.as_integer().unwrap_or_default()),
+        LuaType::String => match String::from_utf8(value.as_bytes().unwrap_or_default().to_vec()) {
+            Ok(s) => QueryParams::Text(s),
+            Err(e) => QueryParams::Bytes(e.into_bytes()),
+        },
+        LuaType::Table => {
             let mut buffer = Vec::new();
-            if let Err(err) = encode_table(&mut buffer, &val, 0, false, &options) {
-                drop(buffer);
-                laux::lua_error(state, err);
-            }
-            if buffer[0] == b'{' || buffer[0] == b'[' {
+            encode_table(&mut buffer, lua, i, 0, false, &options)?;
+            if !buffer.is_empty() && (buffer[0] == b'{' || buffer[0] == b'[') {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(buffer.as_slice()) {
                     QueryParams::Json(value)
                 } else {
@@ -365,587 +895,481 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
                 QueryParams::Bytes(buffer)
             }
         }
-        _t => {
+        _ => {
             return Err(format!(
-                "get_query_param: unsupport value type :{}",
-                laux::type_name(state, i)
+                "get_query_param: unsupported value type: {}",
+                value.name()
             ));
         }
     };
     Ok(res)
 }
 
-extern "C-unwind" fn query(state: LuaState) -> i32 {
+fn query(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    query_impl(lua, false)
+}
+fn exec_query(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    query_impl(lua, true)
+}
+
+fn query_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
+    let (owner, session) = crate::take_route(lua, 2)?;
+    let session = if forget { 0 } else { session };
+    let state = lua.state();
     let mut args = LuaArgs::new(1);
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
-        .expect("Invalid database connect pointer");
+    let conn_ptr = lua
+        .value(args.iter_arg())
+        .as_userdata::<DatabaseConnection>()
+        .ok_or_else(|| "invalid database connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
 
-    let owner = laux::lua_get(state, args.iter_arg());
-    let session = laux::lua_get(state, args.iter_arg());
-
-    let sql = laux::lua_get::<&str>(state, args.iter_arg());
+    let sql = lua
+        .get::<String>(args.iter_arg())
+        .map_err(|err| format!("sqlx.query: {err}"))?;
     let mut params = Vec::new();
     let top = laux::lua_top(state);
     for i in args.iter_arg()..=top {
-        let param = get_query_param(state, i);
-        match param {
-            Ok(value) => {
-                params.push(value);
-            }
+        match get_query_param(lua, i) {
+            Ok(value) => params.push(value),
             Err(err) => {
-                push_lua_table!(
-                    state,
-                    "kind" => "ERROR",
-                    "message" => err
-                );
-                return 1;
+                push_lua_table!(state, "kind" => "ERROR", "message" => err);
+                return Ok(1);
             }
         }
     }
 
-    match conn.tx.try_send(DatabaseRequest::Query(
-        owner,
-        session,
-        DatabaseQuery {
-            sql: sql.to_string(),
-            binds: params,
-        },
-    )) {
-        Ok(_) => {
-            conn.counter
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            laux::lua_push(state, session);
-            1
-        }
-        Err(err) => {
-            push_lua_table!(
-                state,
-                "kind" => "ERROR",
-                "message" => err.to_string()
-            );
-            1
+    Ok(dispatch_request(
+        state,
+        &conn.tx,
+        &conn.counter,
+        DatabaseRequest::Query(
+            owner,
+            session,
+            DatabaseQuery {
+                sql: Arc::new(sql),
+                binds: params,
+            },
+        ),
+    ))
+}
+
+fn query_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let (owner, session) = crate::take_route(lua, 2)?;
+    let state = lua.state();
+    let mut args = LuaArgs::new(1);
+    let conn_ptr = lua
+        .value(args.iter_arg())
+        .as_userdata::<DatabaseConnection>()
+        .ok_or_else(|| "invalid database connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
+
+    // Parse as i64 so a negative Lua integer is rejected rather than wrapping
+    // to a huge `usize`. `batch_size == 0` would make the stream handler emit
+    // empty batches forever, so require >= 1.
+    let batch_size: i64 = lua
+        .opt(args.iter_arg())
+        .unwrap_or(crate::LIMITS.db_stream_batch_rows);
+    if batch_size < 1 || batch_size as u64 > crate::LIMITS.db_query_rows as u64 {
+        push_lua_table!(
+            state,
+            "kind" => "ERROR",
+            "message" => format!(
+                "query_stream: batch_size must be between 1 and {}",
+                crate::LIMITS.db_query_rows
+            )
+        );
+        return Ok(1);
+    }
+    let batch_size = batch_size as usize;
+    let sql = lua
+        .get::<String>(args.iter_arg())
+        .map_err(|err| format!("sqlx.query_stream: {err}"))?;
+    let mut params = Vec::new();
+    let top = laux::lua_top(state);
+    for i in args.iter_arg()..=top {
+        match get_query_param(lua, i) {
+            Ok(value) => params.push(value),
+            Err(err) => {
+                push_lua_table!(state, "kind" => "ERROR", "message" => err);
+                return Ok(1);
+            }
         }
     }
+
+    Ok(dispatch_request(
+        state,
+        &conn.tx,
+        &conn.counter,
+        DatabaseRequest::QueryStream(
+            owner,
+            session,
+            DatabaseQuery {
+                sql: Arc::new(sql),
+                binds: params,
+            },
+            batch_size,
+        ),
+    ))
 }
 
-struct TransactionQuerys {
-    querys: Vec<DatabaseQuery>,
-}
+fn push_transaction_query(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut queries_ptr = lua
+        .value(1)
+        .as_userdata::<TransactionQueries>()
+        .ok_or_else(|| "invalid transaction queries pointer".to_string())?;
 
-extern "C-unwind" fn push_transaction_query(state: LuaState) -> i32 {
-    let querys = laux::lua_touserdata::<TransactionQuerys>(state, 1)
-        .expect("Invalid transaction query pointer");
-
-    let sql = laux::lua_get::<&str>(state, 2);
+    let sql = lua
+        .get::<String>(2)
+        .map_err(|err| format!("sqlx.transaction.push: {err}"))?;
     let mut params = Vec::new();
     let top = laux::lua_top(state);
     for i in 3..=top {
-        let param = get_query_param(state, i);
-        match param {
-            Ok(value) => {
-                params.push(value);
-            }
+        match get_query_param(lua, i) {
+            Ok(value) => params.push(value),
             Err(err) => {
                 drop(params);
-                laux::lua_error(state, err);
+                return Err(err);
             }
         }
     }
 
-    querys.querys.push(DatabaseQuery {
-        sql: sql.to_string(),
+    unsafe { queries_ptr.as_mut() }.queries.push(DatabaseQuery {
+        sql: Arc::new(sql),
         binds: params,
     });
 
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn make_transaction(state: LuaState) -> i32 {
+fn make_transaction(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     laux::lua_newuserdata(
         state,
-        TransactionQuerys { querys: Vec::new() },
+        TransactionQueries {
+            queries: Vec::new(),
+        },
         cstr!("sqlx_transaction_metatable"),
-        &[lreg!("push", push_transaction_query), lreg_null!()],
+        &[lreg_try!("push", push_transaction_query), lreg_null!()],
     );
     1
 }
 
-extern "C-unwind" fn transaction(state: LuaState) -> i32 {
+fn transaction(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    transaction_impl(lua, false)
+}
+fn exec_transaction(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    transaction_impl(lua, true)
+}
+
+fn transaction_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
+    let (owner, session) = crate::take_route(lua, 2)?;
+    let session = if forget { 0 } else { session };
+    let state = lua.state();
     let mut args = LuaArgs::new(1);
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
-        .expect("Invalid database connect pointer");
+    let conn_ptr = lua
+        .value(args.iter_arg())
+        .as_userdata::<DatabaseConnection>()
+        .ok_or_else(|| "invalid database connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
 
-    let owner = laux::lua_get(state, args.iter_arg());
-    let session = laux::lua_get(state, args.iter_arg());
+    let mut queries_ptr = lua
+        .value(args.iter_arg())
+        .as_userdata::<TransactionQueries>()
+        .ok_or_else(|| "invalid transaction queries pointer".to_string())?;
 
-    let querys = laux::lua_touserdata::<TransactionQuerys>(state, args.iter_arg())
-        .expect("Invalid transaction query pointer");
-
-    match conn.tx.try_send(DatabaseRequest::Transaction(
-        owner,
-        session,
-        std::mem::take(&mut querys.querys),
-    )) {
-        Ok(_) => {
-            conn.counter
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            laux::lua_push(state, session);
-            1
-        }
-        Err(err) => {
-            push_lua_table!(
-                state,
-                "kind" => "ERROR",
-                "message" => err.to_string()
-            );
-            1
-        }
-    }
+    Ok(dispatch_request(
+        state,
+        &conn.tx,
+        &conn.counter,
+        DatabaseRequest::Transaction(
+            owner,
+            session,
+            std::mem::take(&mut unsafe { queries_ptr.as_mut() }.queries),
+        ),
+    ))
 }
 
-extern "C-unwind" fn close(state: LuaState) -> i32 {
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1)
-        .expect("Invalid database connect pointer");
+fn close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let conn_ptr = lua
+        .value(1)
+        .as_userdata::<DatabaseConnection>()
+        .ok_or_else(|| "invalid database connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
 
-    match conn.tx.try_send(DatabaseRequest::Close()) {
-        Ok(_) => {
-            laux::lua_push(state, true);
-            1
-        }
-        Err(err) => {
-            push_lua_table!(
-                state,
-                "kind" => "ERROR",
-                "message" => err.to_string()
-            );
-            1
-        }
-    }
+    Ok(dispatch_request(
+        state,
+        &conn.tx,
+        &conn.counter,
+        DatabaseRequest::Close(),
+    ))
 }
 
-#[derive(Copy, Clone)]
-enum DbType {
-    Int8,
-    UInt8,
-    Int16,
-    UInt16,
-    Int32,
-    UInt32,
-    Int64,
-    UInt64,
-    Float32,
-    Float64,
-    Text,
-    Bool,
-    Timestamp,
-    Date,
-    Time,
-    Uuid,
-    Bytes,
-    Json,
-    Null,
-    UnsupportedDecimal,
-    UnsupportedTimeWithTz,
-    Unknown,
-}
-
-static DB_TYPE_MAP: phf::Map<&'static str, DbType> = phf::phf_map! {
-    // Int32 types
-    "INT4" => DbType::Int32,
-    "INT" => DbType::Int32,
-    "INTEGER" => DbType::Int32,
-    "MEDIUMINT" => DbType::Int32,
-    // Int64 types
-    "INT8" => DbType::Int64,
-    "BIGINT" => DbType::Int64,
-    // Int16 types
-    "INT2" => DbType::Int16,
-    "SMALLINT" => DbType::Int16,
-    // Int8 type
-    "TINYINT" => DbType::Int8,
-    // Float64 types
-    "FLOAT8" => DbType::Float64,
-    "DOUBLE" => DbType::Float64,
-    // Float32 types
-    "FLOAT4" => DbType::Float32,
-    "FLOAT" => DbType::Float32,
-    "REAL" => DbType::Float32,
-    // Text types
-    "TEXT" => DbType::Text,
-    "VARCHAR" => DbType::Text,
-    "CHAR" => DbType::Text,
-    "BPCHAR" => DbType::Text,
-    "NAME" => DbType::Text,
-    "TINYTEXT" => DbType::Text,
-    "MEDIUMTEXT" => DbType::Text,
-    "LONGTEXT" => DbType::Text,
-    "NVARCHAR" => DbType::Text,
-    "NCHAR" => DbType::Text,
-    // Bool types
-    "BOOL" => DbType::Bool,
-    "BOOLEAN" => DbType::Bool,
-    // Timestamp types
-    "TIMESTAMP" => DbType::Timestamp,
-    "TIMESTAMPTZ" => DbType::Timestamp,
-    "DATETIME" => DbType::Timestamp,
-    // Date type
-    "DATE" => DbType::Date,
-    // Time type
-    "TIME" => DbType::Time,
-    // UUID type
-    "UUID" => DbType::Uuid,
-    // Bytes types
-    "BYTEA" => DbType::Bytes,
-    "BLOB" => DbType::Bytes,
-    "VARBINARY" => DbType::Bytes,
-    "BINARY" => DbType::Bytes,
-    "TINYBLOB" => DbType::Bytes,
-    "MEDIUMBLOB" => DbType::Bytes,
-    "LONGBLOB" => DbType::Bytes,
-    // Json types
-    "JSON" => DbType::Json,
-    "JSONB" => DbType::Json,
-    // Null type
-    "NULL" => DbType::Null,
-    // Unsupported decimal types
-    "DECIMAL" => DbType::UnsupportedDecimal,
-    "NUMERIC" => DbType::UnsupportedDecimal,
-    "MONEY" => DbType::UnsupportedDecimal,
-    // Unsupported time with timezone
-    "TIMETZ" => DbType::UnsupportedTimeWithTz,
-    // Unsigned types
-    "TINYINT UNSIGNED" => DbType::UInt8,
-    "SMALLINT UNSIGNED" => DbType::UInt16,
-    "INT UNSIGNED" => DbType::UInt32,
-    "MEDIUMINT UNSIGNED" => DbType::UInt32,
-    "BIGINT UNSIGNED" => DbType::UInt64,
-};
-
-impl DbType {
-    #[inline]
-    fn from_name(name: &str) -> Self {
-        DB_TYPE_MAP.get(name).copied().unwrap_or(Self::Unknown)
-    }
-}
-
-fn process_rows<'a, DB>(state: LuaState, rows: &'a [<DB as Database>::Row]) -> Result<i32, String>
-where
-    DB: sqlx::Database,
-    usize: ColumnIndex<<DB as Database>::Row>,
-    i8: sqlx::Decode<'a, DB>,
-    i16: sqlx::Decode<'a, DB>,
-    i32: sqlx::Decode<'a, DB>,
-    i64: sqlx::Decode<'a, DB>,
-    f32: sqlx::Decode<'a, DB>,
-    f64: sqlx::Decode<'a, DB>,
-    bool: sqlx::Decode<'a, DB>,
-    &'a str: sqlx::Decode<'a, DB>,
-    &'a [u8]: sqlx::Decode<'a, DB>,
-    NaiveDate: sqlx::Decode<'a, DB>,
-    NaiveDateTime: sqlx::Decode<'a, DB>,
-    NaiveTime: sqlx::Decode<'a, DB>,
-    Uuid: sqlx::Decode<'a, DB>,
-{
-    let table = LuaTable::new(state, rows.len(), 0);
-    if rows.is_empty() {
-        return Ok(1);
-    }
-
-    let column_info: Vec<(usize, &str, DbType)> = rows
-        .first()
-        .unwrap()
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            let name = column.name();
-            let db_type = DbType::from_name(column.type_info().name());
-            (index, name, db_type)
-        })
-        .collect();
-
-    for (i, row) in rows.iter().enumerate() {
-        let row_table = LuaTable::new(state, 0, row.len());
-        for (index, column_name, db_type) in column_info.iter() {
-            match row.try_get_raw(*index) {
-                Ok(value) => {
-                    if value.is_null() {
-                        row_table.insert(*column_name, LuaNil {});
-                        continue;
-                    }
-
-                    match db_type {
-                        DbType::Int8 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i8);
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::UInt8 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i8) as u8;
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Int16 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i16);
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::UInt16 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i16) as u16;
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Int32 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i32);
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::UInt32 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i32) as u32;
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Int64 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i64);
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::UInt64 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0i64) as u64;
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Float32 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0.0f32);
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Float64 => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(0.0f64);
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Text => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or("");
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Bool => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or(false);
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Timestamp => {
-                            match <NaiveDateTime as sqlx::decode::Decode<DB>>::decode(value) {
-                                Ok(dt) => {
-                                    row_table.insert(
-                                        *column_name,
-                                        dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                                    );
-                                }
-                                Err(_) => {
-                                    row_table.insert(*column_name, LuaNil {});
-                                }
-                            }
-                        }
-                        DbType::Date => {
-                            match <NaiveDate as sqlx::decode::Decode<DB>>::decode(value) {
-                                Ok(date) => {
-                                    row_table.insert(*column_name, date.format("%Y-%m-%d").to_string());
-                                }
-                                Err(_) => {
-                                    row_table.insert(*column_name, LuaNil {});
-                                }
-                            }
-                        }
-                        DbType::Time => {
-                            match <NaiveTime as sqlx::decode::Decode<DB>>::decode(value) {
-                                Ok(time) => {
-                                    row_table.insert(*column_name, time.format("%H:%M:%S").to_string());
-                                }
-                                Err(_) => {
-                                    row_table.insert(*column_name, LuaNil {});
-                                }
-                            }
-                        }
-                        DbType::Uuid => {
-                            match <Uuid as sqlx::decode::Decode<DB>>::decode(value) {
-                                Ok(uuid) => {
-                                    row_table.insert(*column_name, uuid.to_string());
-                                }
-                                Err(_) => {
-                                    row_table.insert(*column_name, LuaNil {});
-                                }
-                            }
-                        }
-                        DbType::Bytes => {
-                            let v: &[u8] = sqlx::decode::Decode::decode(value).unwrap_or(b"");
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Json => {
-                            let v = sqlx::decode::Decode::decode(value).unwrap_or("{}");
-                            row_table.insert(*column_name, v);
-                        }
-                        DbType::Null => {
-                            row_table.insert(*column_name, LuaNil {});
-                        }
-                        DbType::UnsupportedDecimal => {
-                            return Err(format!(
-                                "Unsupported decimal type for column '{}'",
-                                column_name
-                            ));
-                        }
-                        DbType::UnsupportedTimeWithTz => {
-                            return Err(format!(
-                                "Unsupported time with time zone type for column '{}'",
-                                column_name
-                            ));
-                        }
-                        DbType::Unknown => {
-                            if let Ok(bytes) = sqlx::decode::Decode::decode(value) {
-                                row_table.insert::<&str, &[u8]>(*column_name, bytes);
-                            } else {
-                                row_table.insert(*column_name, LuaNil {});
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    laux::lua_push(state, false);
-                    laux::lua_push(state, format!("{} decode error: {}", column_name, error));
-                    return Ok(2);
-                }
-            }
-        }
-        table.rawseti(i + 1);
-    }
-    Ok(1)
-}
-
-extern "C-unwind" fn find_connection(state: LuaState) -> i32 {
-    let name = laux::lua_get::<&str>(state, 1);
-    match DATABASE_CONNECTIONSS.get(name) {
-        Some(pair) => {
+fn find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let connection = {
+        let name = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "sqlx.find_connection: UTF-8 string expected".to_string())?;
+        DATABASE_CONNECTIONS
+            .get(name)
+            .map(|pair| pair.value().clone())
+    };
+    match connection {
+        Some(connection) => {
             let l = [
-                lreg!("query", query),
-                lreg!("transaction", transaction),
-                lreg!("close", close),
+                lreg_try!("query", query),
+                lreg_try!("exec_query", exec_query),
+                lreg_try!("query_stream", query_stream),
+                lreg_try!("transaction", transaction),
+                lreg_try!("exec_transaction", exec_transaction),
+                lreg_try!("close", close),
                 lreg_null!(),
             ];
             if laux::lua_newuserdata(
                 state,
-                pair.value().clone(),
+                connection,
                 cstr!("sqlx_connection_metatable"),
                 l.as_ref(),
             )
             .is_none()
             {
                 laux::lua_pushnil(state);
-                return 1;
+                return Ok(1);
             }
         }
         None => {
             laux::lua_pushnil(state);
         }
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn decode(state: LuaState) -> i32 {
-    laux::lua_checkstack(state, 6, std::ptr::null());
-    let result = lua_into_userdata::<DatabaseResponse>(state, 1);
+fn sqlx_cursor_next(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let (owner, session) = crate::take_route(lua, 2)?;
+    let state = lua.state();
+    let mut handle_ptr = lua
+        .value(1)
+        .as_userdata::<SqlxCursorHandle>()
+        .ok_or_else(|| "invalid sqlx cursor handle".to_string())?;
+    let handle = unsafe { handle_ptr.as_mut() };
+    if let Some(tx) = handle.0.take() {
+        // If the stream handler has already exited, its receiver is gone and the
+        // send fails. Surface that as an error rather than pushing a session that
+        // would never be answered (which would hang the awaiting coroutine).
+        if tx.send(CursorSignal::Next(owner, session)).is_err() {
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                "sqlx cursor: stream handler is gone",
+            ));
+        }
+        laux::lua_push(state, session);
+        Ok(1)
+    } else {
+        Ok(crate::lua_push_error_tuple(
+            state,
+            "sqlx cursor: already consumed or closed",
+        ))
+    }
+}
 
-    match *result {
-        DatabaseResponse::PgRows(rows) => {
-            return process_rows::<Postgres>(state, &rows)
-                .map_err(|e| {
-                    push_lua_table!(
-                        state,
-                        "kind" => "ERROR",
-                        "message" => e
-                    );
-                })
-                .unwrap_or(1);
+fn sqlx_cursor_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let mut handle_ptr = lua
+        .value(1)
+        .as_userdata::<SqlxCursorHandle>()
+        .ok_or_else(|| "invalid sqlx cursor handle".to_string())?;
+    let handle = unsafe { handle_ptr.as_mut() };
+    if let Some(tx) = handle.0.take() {
+        let _ = tx.send(CursorSignal::Close);
+    }
+    Ok(0)
+}
+
+fn push_cursor_handle(state: LuaState, next_tx: Option<oneshot::Sender<CursorSignal>>) {
+    if let Some(tx) = next_tx {
+        let methods = [
+            lreg_try!("next", sqlx_cursor_next),
+            lreg_try!("close", sqlx_cursor_close),
+            lreg_null!(),
+        ];
+        laux::lua_newuserdata(
+            state,
+            SqlxCursorHandle(Some(tx)),
+            cstr!("sqlx_cursor_handle"),
+            &methods,
+        );
+    } else {
+        laux::lua_pushnil(state);
+    }
+}
+
+fn push_sqlx_response(state: LuaState, result: DatabaseResponse) -> c_int {
+    match result {
+        DatabaseResponse::PgRows(rows) => process_rows::<Postgres>(state, &rows),
+        DatabaseResponse::MysqlRows(rows) => process_rows::<MySql>(state, &rows),
+        DatabaseResponse::SqliteRows(rows) => process_rows::<Sqlite>(state, &rows),
+        DatabaseResponse::PgBatch(rows, next_tx) => {
+            process_rows::<Postgres>(state, &rows);
+            push_cursor_handle(state, next_tx);
+            2
         }
-        DatabaseResponse::MysqlRows(rows) => {
-            return process_rows::<MySql>(state, &rows)
-                .map_err(|e| {
-                    push_lua_table!(
-                        state,
-                        "kind" => "ERROR",
-                        "message" => e
-                    );
-                })
-                .unwrap_or(1);
+        DatabaseResponse::MysqlBatch(rows, next_tx) => {
+            process_rows::<MySql>(state, &rows);
+            push_cursor_handle(state, next_tx);
+            2
         }
-        DatabaseResponse::SqliteRows(rows) => {
-            return process_rows::<Sqlite>(state, &rows)
-                .map_err(|e| {
-                    push_lua_table!(
-                        state,
-                        "kind" => "ERROR",
-                        "message" => e
-                    );
-                })
-                .unwrap_or(1);
+        DatabaseResponse::SqliteBatch(rows, next_tx) => {
+            process_rows::<Sqlite>(state, &rows);
+            push_cursor_handle(state, next_tx);
+            2
         }
         DatabaseResponse::Transaction => {
-            push_lua_table!(
-                state,
-                "message" => "ok"
-            );
-            return 1;
+            push_lua_table!(state, "message" => "ok");
+            1
         }
         DatabaseResponse::Connect => {
-            push_lua_table!(
-                state,
-                "message" => "success"
-            );
-            return 1;
+            push_lua_table!(state, "message" => "success");
+            1
         }
         DatabaseResponse::Error(err) => match err.as_database_error() {
             Some(db_err) => {
-                push_lua_table!(
-                    state,
-                    "kind" => "DB",
-                    "message" => db_err.message()
-                );
+                push_lua_table!(state, "kind" => "DB", "message" => db_err.message());
+                1
             }
             None => {
-                push_lua_table!(
-                    state,
-                    "kind" => "ERROR",
-                    "message" => err.to_string()
-                );
+                push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
+                1
             }
         },
         DatabaseResponse::Timeout(err) => {
-            push_lua_table!(
-                state,
-                "kind" => "TIMEOUT",
-                "message" => err.to_string()
-            );
+            push_lua_table!(state, "kind" => "TIMEOUT", "message" => err.to_string());
+            1
         }
     }
-
-    1
 }
 
-extern "C-unwind" fn stats(state: LuaState) -> i32 {
-    let table = LuaTable::new(state, 0, DATABASE_CONNECTIONSS.len());
-    DATABASE_CONNECTIONSS.iter().for_each(|pair| {
-        table.insert(
-            pair.key().as_str(),
-            pair.value()
-                .counter
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
+fn stats(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let table = LuaTable::new(state, 0, DATABASE_CONNECTIONS.len());
+    DATABASE_CONNECTIONS.iter().for_each(|pair| {
+        let counter = &pair.value().counter;
+        table.rawset_x(pair.key().as_str(), || {
+            crate::request_pool::push_pool_stats(
+                state,
+                counter.load(),
+                counter.total(),
+                counter.peak(),
+                1,
+            );
+        });
     });
     1
 }
 
-#[cfg(feature = "sqlx")]
+fn decode(lua: &mut laux::LuaStack<'_>) -> Result<c_int, String> {
+    let response = unsafe { crate::take_response::<DatabaseResponse>(lua)? };
+    Ok(push_sqlx_response(lua.state(), *response))
+}
+
 #[unsafe(no_mangle)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C-unwind" fn luaopen_rust_sqlx(state: LuaState) -> i32 {
+pub extern "C-unwind" fn luaopen_rust_sqlx(state: LuaState) -> c_int {
     let l = [
-        lreg!("connect", connect),
-        lreg!("find_connection", find_connection),
-        lreg!("decode", decode),
+        lreg_try!("decode", decode),
+        lreg_try!("connect", connect),
+        lreg_try!("find_connection", find_connection),
         lreg!("stats", stats),
         lreg!("make_transaction", make_transaction),
+        lreg_try!("json_param", make_json_param),
         lreg_null!(),
     ];
 
     luaL_newlib!(state, l);
 
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lib_lua::laux::LuaGlobalState;
+    use std::ptr::NonNull;
+
+    #[test]
+    fn decimal_integer_preserves_fractions_and_range() {
+        for (text, expected) in [
+            ("42.000", Some(42)),
+            ("-42", Some(-42)),
+            ("1e3", Some(1000)),
+            ("0.001", None),
+            ("-1.9", None),
+            ("9223372036854775807", Some(i64::MAX)),
+            ("-9223372036854775808", Some(i64::MIN)),
+            ("9223372036854775808", None),
+            ("9223372036854775807.1", None),
+        ] {
+            assert_eq!(decimal_integer(&text.parse().unwrap()), expected, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_sqlite_memory_url_uses_the_sqlite_backend() {
+        let pool = DatabasePool::connect("sqlite::memory:", Duration::from_secs(5), 1)
+            .await
+            .unwrap();
+        let result = pool
+            .query(&DatabaseQuery {
+                sql: Arc::new("SELECT 42 AS value".into()),
+                binds: vec![],
+            })
+            .await
+            .unwrap();
+        let DatabaseResponse::SqliteRows(rows) = result else {
+            panic!("expected SQLite rows")
+        };
+        assert_eq!(rows[0].try_get::<i64, _>(0).unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rows_preserve_binary_and_timestamp_without_assuming_timezone() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(
+            "CREATE TABLE sample (payload BLOB, created TIMESTAMP)",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(
+            "INSERT INTO sample VALUES (X'00FF41', '2026-10-17 12:34:56.123456')",
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows = sqlx::query(sqlx::AssertSqlSafe("SELECT * FROM sample"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let state = NonNull::new(unsafe { ffi::luaL_newstate() }).unwrap();
+        let _owner = LuaGlobalState::new(state);
+        assert_eq!(process_rows::<Sqlite>(state, &rows), 1);
+        unsafe {
+            ffi::lua_rawgeti(state.as_ptr(), -1, 1);
+            ffi::lua_getfield(state.as_ptr(), -1, cstr!("payload"));
+        }
+        let lua = unsafe { LuaStack::from_raw(state) };
+        assert_eq!(lua.value(-1).as_bytes().unwrap(), b"\x00\xffA");
+        unsafe {
+            ffi::lua_settop(state.as_ptr(), 2);
+            ffi::lua_getfield(state.as_ptr(), -1, cstr!("created"));
+        }
+        assert_eq!(
+            lua.value(-1).as_str().unwrap(),
+            "2026-10-17T12:34:56.123456"
+        );
+    }
 }

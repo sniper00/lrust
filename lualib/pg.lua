@@ -1,0 +1,265 @@
+-- Native PostgreSQL driver (Lua 5.5). See docs/pg.md.
+local moon = require("moon")
+local c = require("rust.pg")
+local protocol_type = 27
+
+moon.register_protocol {
+    name = "pg",
+    PTYPE = protocol_type,
+    unpack = function(value) return c.decode(value) end,
+    pack = function(...) return ... end,
+}
+
+---@class pg_result
+---@field public code? string @ error kind: "SOCKET" | "CONFIG" | "ENCODE" | "PROTOCOL" | db SQLSTATE
+---@field public message? string @ error message
+---@field public data? table @ rows / aggregated results
+---@field public num_queries? integer
+---@field public notifications? table
+
+---Structured, injection-safe `ON CONFLICT` specification for `insert_many`.
+---All identifiers are quoted by the native layer. Provide at most one of
+---`columns`/`constraint`; provide `update` for `DO UPDATE SET`, omit for
+---`DO NOTHING`.
+---@class pg_conflict
+---@field public columns? string[] @ conflict-target columns, e.g. { "uid", "key" }
+---@field public constraint? string @ conflict-target constraint name (alternative to columns)
+---@field public update? string[] @ columns to set from EXCLUDED; omit/empty => DO NOTHING
+
+---@class pg
+---@field obj pg_pool
+local M = {}
+M.__index = M
+
+---SQL NULL sentinel, also accepted inside arrays (same value as json.null).
+M.NULL = c.NULL
+
+---Encode a dense Lua sequence as PostgreSQL array text for bound parameters.
+---Use explicit casts such as `$1::int4[]` when the SQL cannot infer the type.
+---Nested sequences must be rectangular (up to six dimensions); use pg.NULL
+---for NULL elements. Strings are escaped; empty arrays become "{}".
+---Pass the result to query_params, execute_params, pipe, or bulk-write methods.
+---Common array results decode to nested sequences. Numeric elements stay exact
+---strings; other textual types keep PostgreSQL formatting. Non-one lower bounds
+---are rejected. Decoded bytea strings retain PostgreSQL hex/escape notation.
+---@param values table
+---@return string
+function M.array(values)
+    return c.array(values)
+end
+
+---Look up an already-connected pool by name and wrap it.
+---@param name string
+---@return pg
+function M.find_connection(name)
+    local o = {
+        obj = assert(c.find_connection(name), "pg connection not found: " .. tostring(name))
+    }
+    return setmetatable(o, M)
+end
+
+---Connect and register a named pool.
+---
+---All parameters live in a single connection URL of the form
+---`postgresql://username:password@host:port/database?param=value&...`.
+---The pool settings are supplied as `?param=value` query parameters:
+---  * `name` (**required**) — pool name for `find_connection`
+---  * `application_name` (default "moon")
+---  * `connect_timeout` — connect timeout in ms (default 5000)
+---  * `max_connections`/`pool_size` — pool size (default 5)
+---  * `read_timeout` — read timeout in ms (default 10000)
+---  * `queue_capacity` — per-worker request queue capacity (default 1024)
+---
+---e.g. `"postgres://postgres:123456@127.0.0.1:5432/postgres?name=main&max_connections=5"`
+---@async
+---@param database_url string connection URL (`postgres://.../db?name=...&param=value`)
+---@return pg|pg_result @ connection object, or an error table (check `.code`)
+function M.connect(database_url)
+    local res = moon.wait(c.connect(protocol_type, moon.id, moon.next_sequence(), database_url))
+    if res.code then
+        return res
+    end
+    return M.find_connection(res.name)
+end
+
+---Pending request count per pool worker (async queue lengths).
+---@return integer[]
+function M:len()
+    return self.obj:len()
+end
+
+---Statistics (pending/total/peak/workers) per named pool.
+---@return table<string, pool_stats>
+function M.stats()
+    return c.stats()
+end
+
+function M:close()
+    self.obj:close()
+end
+M.disconnect = M.close
+
+---Simple query protocol; `sql` may contain multiple `;`-separated statements.
+---
+---**Trust requirement:** `sql` is sent on the wire verbatim with no parameter
+---binding (the simple-query protocol has no placeholders), so it is fully
+---caller-controlled SQL. Never build it from untrusted input — use `query_params`
+---(or `insert_many`/`update_many`) with bound `$1, $2, ...` parameters for
+---anything that includes user data.
+---
+---**Result cap:** the reply is buffered in memory and the call fails if it
+---returns more than 100,000 rows. Paginate large reads with `LIMIT`/`OFFSET`.
+---@async
+---@nodiscard
+---@param sql string trusted, statically-known SQL (no parameter binding)
+---@return pg_result
+function M:query(sql)
+    local res = self.obj:query(moon.id, moon.next_sequence(), sql)
+    if type(res) == "table" then
+        return res
+    end
+    return moon.wait(res)
+end
+
+---Fire-and-forget simple query (no response awaited).
+---
+---**Trust requirement:** like `query`, `sql` is sent verbatim with no binding —
+---never build it from untrusted input; use `execute_params` for user data.
+---@param sql string trusted, statically-known SQL (no parameter binding)
+function M:execute(sql)
+    local res = self.obj:exec_query(moon.id, 0, sql)
+    if type(res) == "table" then
+        moon.error(table.tostring(res))
+    end
+end
+
+---Extended query protocol with bound parameters ($1, $2, ...).
+---@async
+---@nodiscard
+---@param sql string
+---@vararg any
+---@return pg_result
+function M:query_params(sql, ...)
+    local res = self.obj:query_params(moon.id, moon.next_sequence(), sql, ...)
+    if type(res) == "table" then
+        return res
+    end
+    return moon.wait(res)
+end
+
+---Fire-and-forget extended query.
+---@param sql string
+---@vararg any
+function M:execute_params(sql, ...)
+    local res = self.obj:exec_query_params(moon.id, 0, sql, ...)
+    if type(res) == "table" then
+        moon.error(table.tostring(res))
+    end
+end
+
+---Pipeline multiple parameterized statements inside an implicit
+---`BEGIN`/`COMMIT` transaction.
+---@async
+---@nodiscard
+---@param queries table @ `{ {sql, p1, ...}, {sql, p1, ...}, ... }`
+---@return pg_result
+function M:pipe(queries)
+    local res = self.obj:pipe(moon.id, moon.next_sequence(), queries)
+    if type(res) == "table" then
+        return res
+    end
+    return moon.wait(res)
+end
+
+---Fire-and-forget pipeline.
+---@param queries table
+function M:execute_pipe(queries)
+    local res = self.obj:exec_pipe(moon.id, 0, queries)
+    if type(res) == "table" then
+        moon.error(table.tostring(res))
+    end
+end
+
+---Bulk INSERT/UPSERT. Rows are packed into one multi-row `VALUES` statement
+---(one Parse, one Bind, one Execute, one plan), auto-chunked under the 65535
+---parameter limit and wrapped in a transaction when more than one chunk.
+---
+---Note: a single multi-row UPSERT cannot touch the same conflict key twice —
+---de-duplicate keys (keep the latest) before calling.
+---
+---**Conflict handling:** row *values* are always bound as parameters and safe
+---for user data. For the `ON CONFLICT` clause prefer the **table form**, which
+---is built from quoted identifiers and is safe even with untrusted input:
+---  `{ columns = {"uid","key"}, update = {"value"} }`
+---  → `ON CONFLICT ("uid","key") DO UPDATE SET "value"=EXCLUDED."value"`
+---  `{ constraint = "pk" }` → `ON CONFLICT ON CONSTRAINT "pk" DO NOTHING`
+---A **string** `conflict` is still accepted but is appended verbatim as trusted,
+---caller-controlled SQL (only a defense-in-depth `ON CONFLICT` prefix / no
+---`;`,`--`,`/*` check); never build the string form from untrusted input.
+---@async
+---@nodiscard
+---@param table_name string e.g. "userdata"
+---@param columns string[] column names, e.g. { "uid", "key", "value" }
+---@param rows table @ array of value arrays (one value per column)
+---@param conflict? pg_conflict|string table form (safe) or trusted "ON CONFLICT ..." string
+---@return pg_result
+function M:insert_many(table_name, columns, rows, conflict)
+    local res = self.obj:insert_many(moon.id, moon.next_sequence(), table_name, columns, rows, conflict)
+    if type(res) == "table" then
+        return res
+    end
+    return moon.wait(res)
+end
+
+---Fire-and-forget bulk INSERT/UPSERT. Same `conflict` rules as `insert_many`
+---(prefer the safe table form; the string form is trusted, verbatim SQL).
+---@param table_name string e.g. "userdata"
+---@param columns string[] column names, e.g. { "uid", "key", "value" }
+---@param rows table @ array of value arrays (one value per column)
+---@param conflict? pg_conflict|string table form (safe) or trusted "ON CONFLICT ..." string
+function M:execute_insert_many(table_name, columns, rows, conflict)
+    local res = self.obj:exec_insert_many(moon.id, 0, table_name, columns, rows, conflict)
+    if type(res) == "table" then
+        moon.error(table.tostring(res))
+    end
+end
+
+---Bulk UPDATE via `UPDATE ... FROM (VALUES ...)`. Each row is
+---`{ key, set1, set2, ... }` (key value first, then one value per
+---`set_columns` entry). Auto-chunked and transaction-wrapped like insert_many.
+---
+---`key_type` (e.g. "bigint") casts the join key so the index on `key_column`
+---stays usable; omit it and the key is compared as text (works for any type,
+---but no index).
+---@async
+---@nodiscard
+---@param table_name string
+---@param key_column string the column matched in the WHERE clause
+---@param set_columns string[] columns to assign, e.g. { "value", "name" }
+---@param rows table @ array of `{ key, set1, set2, ... }`
+---@param key_type? string e.g. "bigint" — cast the join key to keep its index usable
+---@param set_types? string[] SQL types matching set_columns, e.g. { "int4[]", "text" }; required when text assignment needs an explicit cast
+---@return pg_result
+function M:update_many(table_name, key_column, set_columns, rows, key_type, set_types)
+    local res = self.obj:update_many(moon.id, moon.next_sequence(), table_name, key_column, set_columns, rows, key_type, set_types)
+    if type(res) == "table" then
+        return res
+    end
+    return moon.wait(res)
+end
+
+---Fire-and-forget bulk UPDATE.
+---@param table_name string
+---@param key_column string the column matched in the WHERE clause
+---@param set_columns string[] columns to assign
+---@param rows table @ array of `{ key, set1, set2, ... }`
+---@param key_type? string e.g. "bigint" — cast the join key to keep its index usable
+---@param set_types? string[] SQL types matching set_columns, e.g. { "int4[]", "text" }; required when text assignment needs an explicit cast
+function M:execute_update_many(table_name, key_column, set_columns, rows, key_type, set_types)
+    local res = self.obj:exec_update_many(moon.id, 0, table_name, key_column, set_columns, rows, key_type, set_types)
+    if type(res) == "table" then
+        moon.error(table.tostring(res))
+    end
+end
+
+return M

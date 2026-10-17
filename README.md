@@ -6,6 +6,12 @@ This library provides Lua extensions for [Moon](https://github.com/sniper00/moon
 
 > Add extension library: `premake5 add --package=https://github.com/sniper00/lrust.git`
 
+This extension requires a **Lua 5.5** Moon host. Its Rust callback layer uses
+`laux::LuaStack`, owned parameter conversions and scoped cursors; see
+[the Lua API migration guide](docs/lua-context.md). Lua 5.4 bindings and the
+legacy Rust helper API have been removed. See [shared module migration](docs/shared-modules.md)
+for the synchronized modules and API changes.
+
 - [Libraries](#libraries)
     - [Rust](#rust)
         - [1. Excel Reader](#1-excel-reader)
@@ -451,7 +457,7 @@ Modify `lib-lualib/Cargo.toml` to enable `tiberius` feature。
 
 ```
 [features]
-default = ["excel", "sqlx", "mongodb", "websocket", "http", "json", "tiberius"]
+default = ["excel", "sqlx", "mongodb", "websocket", "http", "json", "pg", "tiberius"]
 ```
 
 ```lua
@@ -555,3 +561,12 @@ end)
 
 ```
 
+
+
+### Native PostgreSQL
+
+The `pg` feature (enabled by default) provides the native PostgreSQL driver on
+Lua 5.5. Use `require("ext.pg")`; the `rust.pg` extension implements protocol,
+connection pooling, parameter binding, pipelines, bulk writes, and PostgreSQL
+arrays. JSON/JSONB results are JSON strings. See [docs/pg.md](docs/pg.md) for the
+API and integration-test commands.
